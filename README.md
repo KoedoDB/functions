@@ -45,13 +45,16 @@ The path inside the function is what follows the name (`/hello/a/b` is `/a/b` in
 ## How it is run
 
 ```sh
-docker run --user 10001:10001 --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges \
-  --memory 512m --cpus 1 -e DENO_DIR=/tmp/deno -e FN_ENV_ALLOW=API_KEY -e API_KEY=... \
+docker run --user 10001:10001 --read-only --tmpfs /tmp:size=64m --tmpfs /sockets:size=1m --tmpfs /denodir:size=256m \
+  --cap-drop ALL --security-opt no-new-privileges \
+  --memory 512m --cpus 1 -e DENO_DIR=/denodir -e FN_ENV_ALLOW=API_KEY -e API_KEY=... \
   -v ./functions:/f:ro -v ./supervisor:/sup:ro <IMAGE> \
-  run --no-prompt --allow-net --allow-read=/f,/tmp,/cache --allow-write=/tmp --allow-run --allow-env /sup/supervisor.ts
+  run --no-prompt --allow-net --allow-read=/f,/tmp,/sockets,/cache --allow-write=/sockets --allow-run --allow-env /sup/supervisor.ts
 ```
 
-The supervisor is trusted platform code. It listens on 9000, and **runs every function in its own Deno process**, started on the function's first request and killed after it has been idle. The process listens on a Unix socket (`DENO_SERVE_ADDRESS`), so two functions never fight for a port. A function process gets a clean environment, and permissions only for its own directory, its socket and its scratch directory: `--allow-net`, `--allow-read=<dir>,<sock>,<scratch>`, `--allow-write=<sock>,<scratch>`, `--allow-env=<the allowed names>`, no `--allow-run`, no `--allow-ffi`, no `--allow-sys`.
+In Kubernetes the three `--tmpfs` are `emptyDir` volumes: `/sockets` (a few bytes: `medium: Memory`, `sizeLimit: 1Mi`), `/tmp` (the functions' scratch space: **disk**, with a `sizeLimit`, so that files do not eat the Pod's memory) and the module cache (a volume with a warmed cache, read-only; see "Warm the cache").
+
+The supervisor is trusted platform code. It listens on 9000, and **runs every function in its own Deno process**, started on the function's first request and killed after it has been idle. The process listens on a Unix socket (`DENO_SERVE_ADDRESS`), so two functions never fight for a port. A function process gets a clean environment, and permissions only for its own directory, its own socket and control directory, and `/tmp` (the functions' scratch space, shared by the functions of the Pod, the only place a function may write, as on Supabase): `--allow-net`, `--allow-read=<dir>,<its socket and control directory>,/tmp`, `--allow-write=<its socket and control directory>,/tmp`, `--allow-env=<the allowed names>`, no `--allow-run`, no `--allow-ffi`, no `--allow-sys`. It starts with `--no-lock` (a function with a `deno.json` would write a `deno.lock` next to it, and the directory is read-only) and `--preload supervisor/shim.ts` (below).
 
 | Setting (environment of the supervisor) | Default | What it does |
 |---|---|---|
@@ -60,6 +63,8 @@ The supervisor is trusted platform code. It listens on 9000, and **runs every fu
 | `REQUEST_MS` | 10000 | A request that takes longer is cancelled (504) and **the function process is killed** (every request running in it fails). |
 | `MAX_CONCURRENT` | 20 | Requests being served by one function process at once. Over it: **429** with `Retry-After: 1`; the function is not touched. A request counts until its answer has been sent to the end. |
 | `HEAP_MB` | 192 | The V8 heap limit of each function process (for a Pod of 512 MiB). **Set it** (see "Memory"). |
+| `MAX_BACKGROUND_MS` | 150000 | A function with work left after its answer (`EdgeRuntime.waitUntil`) is not stopped as idle for this long after its last request. |
+| `CONTROL_DIR` | `/sockets` | Where the sockets and control files of the function processes are. Give it a tmpfs of its own, not `/tmp`: a function may write to `/tmp`, and must not reach another function's socket. |
 | `START_MS` | 30000 | How long to wait for a process to start listening. |
 | `CACHED_ONLY` | off | `1`: a function process never downloads a module (`--cached-only`). |
 
@@ -75,6 +80,19 @@ docker run --rm -e DENO_DIR=/cache -v ./cache:/cache -v ./functions:/f:ro <IMAGE
 ```
 
 With the warmed (read-only) cache the drizzle function answers its first request in about 0.2 s; a module that is not in the cache fails in about 40 ms (502) instead of being downloaded.
+
+## Supabase compatibility
+
+Checked with the tests (a function written for Supabase runs as it is):
+
+- `Deno.serve(handler)`; a shared helper imported by a relative path (`../_shared/cors.ts`); a function with its own `deno.json` (import map); npm, jsr and `https://deno.land`, `esm.sh` imports (Deno's default list of hosts); writing to `/tmp`; `Deno.env.get(...)` for the variables the platform allows.
+- **`EdgeRuntime.waitUntil(promise)`** (Supabase's way to keep working after the answer) does not exist in plain Deno. `supervisor/shim.ts`, preloaded into every function process, defines it. A Deno process lives on after an answer, so an un-awaited promise would run by itself; the shim adds three things: a failing task is logged and does not end the process (an uncaught rejection ends a Deno process, and every request running in it), the supervisor does not stop the process as idle while a task is working (up to `MAX_BACKGROUND_MS`), and a task that is not a promise is accepted.
+
+Not compatible, and so a function has to be changed (a few lines):
+
+- **`serve()` from an old `https://deno.land/std@0.1xx/http/server.ts`** listens on TCP port 8000 and ignores `DENO_SERVE_ADDRESS`; the function never answers and the supervisor reports 502 after `START_MS`. Use `Deno.serve(handler)`.
+- WebSocket (`Deno.upgradeWebSocket`) and server-sent events are not supported (the supervisor proxies with `fetch`); not tested.
+- The platform has to give the function what Supabase gives: `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY` and `SUPABASE_DB_URL` (add the names to `FN_ENV_ALLOW`), and verify the JWT in front of a function (Supabase's `verify_jwt`, which a webhook turns off) at the gateway. The wall-clock limit is `REQUEST_MS` (Supabase: 150 s, 400 s on paid plans); there is no CPU-time limit (Supabase: 2 s).
 
 ## Known limits (the tests record them)
 
@@ -99,12 +117,14 @@ The memory of a function grows with the number of requests it serves **at the sa
 
 ## What the tests check
 
-`tests/run.sh` (65 checks) runs the pinned image with the supervisor, hardened (uid 10001, read-only root, `--cap-drop ALL`, memory 512 MiB), and checks:
+`tests/run.sh` (73 checks) runs the pinned image with the supervisor, hardened (uid 10001, read-only root, `--cap-drop ALL`, memory 512 MiB), and checks:
 
 - routing: the path, the query, the method, the headers and the body (also 5 MB), the status of the answer, 404, bad names;
 - the life cycle: nothing runs before the first request, a cold start, idle stop, restart, a function that exits;
 - permissions: its own environment variable and no other, files, `/proc`, writing, programs, FFI, system information are refused; the known limits above are checked as they are, so a change is noticed;
 - limits: an endless loop or a sleep is cancelled (504) and the other functions do not feel it, a 200 MB answer, a filled heap (6 of 6 with `HEAP_MB`), buffers eaten up to the limit (the Pod serves again within 30 s);
+- `/tmp` is writable and the control directory is not;
+- `EdgeRuntime.waitUntil`: the answer is at once, the process is kept while a task works, a task that never ends is stopped after `MAX_BACKGROUND_MS`, a failing task is logged and the process lives on; a function with a `deno.json` starts;
 - concurrency: 25 requests at once against a limit of 10 give exactly 10 answers and 15 times 429, another function still answers, a 429 carries `Retry-After`, and an answer that is still being streamed counts as in flight;
 - the warm cache: a heavy function answers at once from a read-only cache, an uncached module fails at once;
 - modern JavaScript: the versions, 17 language and runtime features, AES-GCM, and 7 npm packages imported dynamically.

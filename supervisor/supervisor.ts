@@ -12,6 +12,9 @@
 //                 (ArrayBuffers): see the README, "Memory".
 //   MAX_CONCURRENT  requests being served by one function process at the same time (default 20). The memory a function uses grows with the number of requests in flight (rate times
 //                 latency), not with the rate. Over the limit: 429 with Retry-After, and the function is not touched. (The rate, requests per second, is limited at the gateway.)
+//   MAX_BACKGROUND_MS  a function that has work left after its answer (EdgeRuntime.waitUntil, see shim.ts) is not stopped as idle for this long after its last request (default 150000)
+//   CONTROL_DIR   where the sockets and the control files of the function processes are (default /sockets: give it a tmpfs of its own, not /tmp). A function may touch only its own there;
+//                 /tmp is the functions' own, shared by all the functions of the Pod, as on Supabase (the file system is read-only except /tmp)
 //   START_MS      how long to wait for a function process to listen (default 30000); a function whose modules are not cached yet can take several seconds
 //   CACHED_ONLY   1: a function process never downloads a module (--cached-only). The cache is warmed at deploy time (README, "Warm the cache"); a module that is not in it fails at once
 const FUNCTIONS = '/f';
@@ -19,6 +22,9 @@ const IDLE_MS = Number(Deno.env.get('IDLE_MS') ?? 30000);
 const REQUEST_MS = Number(Deno.env.get('REQUEST_MS') ?? 10000);
 const HEAP_MB = Number(Deno.env.get('HEAP_MB') ?? 192);   // 0: leave it to Deno
 const MAX_CONCURRENT = Number(Deno.env.get('MAX_CONCURRENT') ?? 20);
+const MAX_BACKGROUND_MS = Number(Deno.env.get('MAX_BACKGROUND_MS') ?? 150000);
+const SHIM = new URL('./shim.ts', import.meta.url).pathname;   // /sup/shim.ts
+const CONTROL = Deno.env.get('CONTROL_DIR') ?? '/sockets';
 const START_MS = Number(Deno.env.get('START_MS') ?? 30000);
 const CACHED_ONLY = Deno.env.get('CACHED_ONLY') === '1';
 const ALLOWED_ENV = (Deno.env.get('FN_ENV_ALLOW') ?? '').split(',').map((s) => s.trim()).filter(Boolean);
@@ -42,15 +48,18 @@ function stop(name: string, fn: Fn) {
 }
 
 function start(name: string): Fn {
-  const dir = `${FUNCTIONS}/${name}`, sock = `/tmp/fn-${name}.sock`, scratch = `/tmp/fn-${name}`;
+  const dir = `${FUNCTIONS}/${name}`, sock = `${CONTROL}/fn-${name}.sock`, scratch = `${CONTROL}/fn-${name}`;
   try { Deno.removeSync(sock); } catch { /* none */ }
   Deno.mkdirSync(scratch, { recursive: true });
+  try { Deno.removeSync(`${scratch}/.pending`); } catch { /* none: a file of an earlier process must not keep this one alive */ }
   // The function gets a clean environment: its socket address, the module cache, and the variables it is allowed to read.
   const env: Record<string, string> = { DENO_SERVE_ADDRESS: `unix:${sock}`, DENO_DIR: Deno.env.get('DENO_DIR') ?? '/tmp/deno', NO_COLOR: '1' };
   for (const k of ALLOWED_ENV) { const v = Deno.env.get(k); if (v !== undefined) env[k] = v; }
-  const args = ['run', '--no-prompt', '--allow-net', `--allow-read=${dir},${sock},${scratch}`, `--allow-write=${sock},${scratch}`,
+  const args = ['run', '--no-prompt', '--allow-net', `--allow-read=${dir},${sock},${scratch},/tmp`, `--allow-write=${sock},${scratch},/tmp`,
     `--allow-env=${['DENO_SERVE_ADDRESS', ...ALLOWED_ENV].join(',')}`,
-    ...(HEAP_MB > 0 ? [`--v8-flags=--max-old-space-size=${HEAP_MB}`] : []), ...(CACHED_ONLY ? ['--cached-only'] : []), `${dir}/index.ts`];
+    ...(HEAP_MB > 0 ? [`--v8-flags=--max-old-space-size=${HEAP_MB}`] : []), ...(CACHED_ONLY ? ['--cached-only'] : []),
+    '--no-lock',   // a function with a deno.json would write a deno.lock next to it, and the directory is read-only
+    `--preload=${SHIM}`, `${dir}/index.ts`];
   const child = new Deno.Command(Deno.execPath(), { args, clearEnv: true, env, stdout: 'inherit', stderr: 'inherit' }).spawn();
   const client = Deno.createHttpClient({ proxy: { transport: 'unix', path: sock } });
   const fn: Fn = { child, client, last: Date.now(), ready: waitForSocket(sock, child), inflight: 0 };
@@ -60,7 +69,15 @@ function start(name: string): Fn {
   return fn;
 }
 
-setInterval(() => { for (const [n, f] of running) if (Date.now() - f.last > IDLE_MS) stop(n, f); }, 1000);
+function backgroundWork(name: string): number {   // how many EdgeRuntime.waitUntil tasks the function still has (the shim writes it)
+  try { return Number(Deno.readTextFileSync(`${CONTROL}/fn-${name}/.pending`)) || 0; } catch { return 0; }
+}
+setInterval(() => {
+  for (const [n, f] of running) {
+    const idle = Date.now() - f.last;
+    if (idle > IDLE_MS && !(f.inflight === 0 && idle < MAX_BACKGROUND_MS && backgroundWork(n) > 0)) stop(n, f);
+  }
+}, 1000);
 
 Deno.serve({ port: 9000 }, async (req) => {
   const url = new URL(req.url);

@@ -26,9 +26,9 @@ step() { echo; echo "== $1"; }
 # start [docker options]: the supervisor in a hardened container with the limits of the Pod; the functions of tests/functions are mounted read-only at /f
 start() {
   docker rm -f "${run}-fn" >/dev/null 2>&1
-  docker run -d --name "${run}-fn" --user 10001:10001 --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges --memory 512m --memory-swap 512m --cpus 1 -p 127.0.0.1::9000 \
-    -e DENO_DIR=/tmp/deno -e FN_ENV_ALLOW=GREETING -e GREETING=hi -e SUPERVISOR_ONLY_SECRET=made-up-supervisor-secret "$@" \
-    -v "$here/tests/functions:/f:ro" -v "$here/supervisor:/sup:ro" "$IMAGE" run --no-prompt --allow-net --allow-read=/f,/tmp,/cache --allow-write=/tmp --allow-run --allow-env /sup/supervisor.ts >/dev/null
+  docker run -d --name "${run}-fn" --user 10001:10001 --read-only --tmpfs /tmp:size=64m --tmpfs /sockets:size=1m --tmpfs /denodir:size=256m --cap-drop ALL --security-opt no-new-privileges --memory 512m --memory-swap 512m --cpus 1 -p 127.0.0.1::9000 \
+    -e DENO_DIR=/denodir -e FN_ENV_ALLOW=GREETING -e GREETING=hi -e SUPERVISOR_ONLY_SECRET=made-up-supervisor-secret "$@" \
+    -v "$here/tests/functions:/f:ro" -v "$here/supervisor:/sup:ro" "$IMAGE" run --no-prompt --allow-net --allow-read=/f,/tmp,/sockets,/cache --allow-write=/sockets --allow-run --allow-env /sup/supervisor.ts >/dev/null
   port="$(docker port "${run}-fn" 9000/tcp | head -1 | sed 's/.*://')"
   for _ in $(seq 60); do curl -s -m 1 "http://127.0.0.1:$port/_stats" >/dev/null && return 0; sleep 0.25; done; return 1
 }
@@ -72,7 +72,8 @@ step "What a function can and cannot do (Deno permissions)"
 check "its own environment variable is readable, the supervisor's is not" '[ "$(probe ownEnv)" = "{\"ok\":true,\"value\":\"hi\"}" ] && denied otherEnv'
 check "reading all of the environment is refused" 'denied envAll'
 check "reading a file outside its own directory is refused (/etc/passwd, /proc/self/environ, /, a sibling function, the supervisor)" 'for p in readPasswd readProcEnviron listRoot listFunctions readOtherFunction readSupervisor; do denied $p || { echo "$p"; exit 1; }; done'
-check "writing anywhere but its own scratch directory is refused (/x, /tmp/x)" 'denied writeRoot && denied writeTmp'
+check "writing is refused everywhere except /tmp: not /x, not the control directory of the sockets" 'denied writeRoot && denied writeSockets && denied readSockets'
+check "/tmp is writable and readable (as on Supabase): a file written there can be read back" 'probe writeTmp | grep -q "\"ok\": *true" && [ "$(probe readTmp | python3 -c "import sys,json; print(json.load(sys.stdin).get(\"value\"))")" = x ]'
 check "starting a program is refused" 'denied spawn && denied kill'
 check "native code (FFI) is refused" 'denied ffi'
 check "system information (hostname, OS release, uid) is refused" 'denied hostname && denied osRelease && denied uid'
@@ -118,6 +119,24 @@ for i in 1 2 3 4 5; do
   [ "$back" = 1 ] && survived=$((survived + 1)); [ "$(docker inspect -f '{{.RestartCount}}' "${run}-fn")" != 0 ] && restarted=$((restarted + 1))
 done
 check "ArrayBuffers eaten up to the Pod limit: the Pod serves again within 30 s in every run: $survived of 5 runs ($restarted of them needed a restart of the container)" '[ "$survived" = 5 ]'
+
+step "EdgeRuntime.waitUntil: work after the answer (Supabase's background-task API)"
+note "Plain Deno has no EdgeRuntime. supervisor/shim.ts is preloaded into every function process and defines EdgeRuntime.waitUntil: a failing task is logged and does not end the process, and the supervisor does not stop the process as idle while a task is working (for up to MAX_BACKGROUND_MS)."
+start -e IDLE_MS=2000 -e MAX_BACKGROUND_MS=12000 >/dev/null
+req "/waituntil/a?ms=5000"
+check "the function answers 202 at once, with EdgeRuntime.waitUntil defined" '[ "$CODE" = 202 ] && [ "$BODY" = accepted ]'
+sleep 4
+check "after IDLE_MS (2 s) it is NOT stopped: a task is still working (4 s into a 5 s task)" 'curl -s "http://127.0.0.1:$port/_stats" | grep -q waituntil'
+sleep 3
+check "the task ran to its end after the answer (WAITUNTIL-DONE is in the log)" 'docker logs "${run}-fn" 2>&1 | grep -q "WAITUNTIL-DONE 5000"'
+sleep 3
+check "when the task is done, the idle stop works again" '! curl -s "http://127.0.0.1:$port/_stats" | grep -q waituntil'
+req "/waituntil/a?ms=60000"; sleep 15
+check "a task that never ends does not keep the process for ever: it is stopped after MAX_BACKGROUND_MS (12 s) without a request" '! curl -s "http://127.0.0.1:$port/_stats" | grep -q waituntil'
+req /hello/a; req /waituntilfail/a; sleep 1.5; req /waituntilfail/a
+check "a task that fails is logged, the process does not end, and the next request is served by the same process" 'docker logs "${run}-fn" 2>&1 | sed "s/\x1b\[[0-9;]*m//g" | grep -q "the task failed" && [ "$CODE" = 202 ] && curl -s "http://127.0.0.1:$port/_stats" | grep -q waituntilfail'
+req /importmap/a
+check "a function with its own deno.json (import map) starts although the directory is read-only (no lock file)" '[ "$CODE" = 200 ] && printf %s "$BODY" | grep -q "\"success\":true"'
 
 step "Warm the module cache: a heavy function starts at once, and nothing is downloaded at run time"
 note "drizzle-orm pulls in a long list of npm packages: with a cold cache its first start takes 5-7 s. At deploy time the cache is warmed (deno cache); at run time CACHED_ONLY=1 forbids every download."
