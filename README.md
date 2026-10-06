@@ -58,6 +58,7 @@ The supervisor is trusted platform code. It listens on 9000, and **runs every fu
 | `FN_ENV_ALLOW` | none | Comma-separated names of the variables a function may read (the project's function secrets). Nothing else is passed on. |
 | `IDLE_MS` | 30000 | A function process with no request for this long is killed. |
 | `REQUEST_MS` | 10000 | A request that takes longer is cancelled (504) and **the function process is killed** (every request running in it fails). |
+| `MAX_CONCURRENT` | 20 | Requests being served by one function process at once. Over it: **429** with `Retry-After: 1`; the function is not touched. A request counts until its answer has been sent to the end. |
 | `HEAP_MB` | 192 | The V8 heap limit of each function process (for a Pod of 512 MiB). **Set it** (see "Memory"). |
 | `START_MS` | 30000 | How long to wait for a process to start listening. |
 | `CACHED_ONLY` | off | `1`: a function process never downloads a module (`--cached-only`). |
@@ -82,6 +83,10 @@ With the warmed (read-only) cache the drizzle function answers its first request
 - **Memory:** see below.
 - Not supported by the supervisor, and not tested: WebSocket and server-sent-event functions (the supervisor proxies with `fetch`).
 
+## Rate and concurrency
+
+The memory of a function grows with the number of requests it serves **at the same time** (the rate times the latency), not with the rate: five requests per second that take 10 seconds each are 50 at once. So the supervisor limits the requests in flight per function (`MAX_CONCURRENT`). The rate, requests per second per project, is limited at the gateway (Envoy), not here.
+
 ## Memory
 
 - **Set the V8 heap limit per function process (`HEAP_MB`).** Left to Deno, every process takes about half of the container's memory limit as its own limit, so the processes of one Pod (the supervisor and its functions) add up to more than the Pod has, and the kernel kills one before V8 stops it: with the supervisor and two functions in a 512 MiB Pod, six runs of a function that fills its heap ended six times in a kernel kill, and once the Pod itself was killed. With `HEAP_MB=192`, V8 stops only that function (`Reached heap limit`, 502) and the kernel kills nothing: 8 of 8 runs. (Deno 2.4.1 needed `DENO_USE_CGROUPS=1` to see the container's limit at all; 2.9.7 sees it by default.)
@@ -94,12 +99,13 @@ With the warmed (read-only) cache the drizzle function answers its first request
 
 ## What the tests check
 
-`tests/run.sh` (61 checks) runs the pinned image with the supervisor, hardened (uid 10001, read-only root, `--cap-drop ALL`, memory 512 MiB), and checks:
+`tests/run.sh` (65 checks) runs the pinned image with the supervisor, hardened (uid 10001, read-only root, `--cap-drop ALL`, memory 512 MiB), and checks:
 
 - routing: the path, the query, the method, the headers and the body (also 5 MB), the status of the answer, 404, bad names;
 - the life cycle: nothing runs before the first request, a cold start, idle stop, restart, a function that exits;
 - permissions: its own environment variable and no other, files, `/proc`, writing, programs, FFI, system information are refused; the known limits above are checked as they are, so a change is noticed;
-- limits: an endless loop or a sleep is cancelled (504) and the other functions do not feel it, a 200 MB answer, a filled heap (8 of 8 with `HEAP_MB`), buffers eaten up to the limit (the Pod serves again within 30 s);
+- limits: an endless loop or a sleep is cancelled (504) and the other functions do not feel it, a 200 MB answer, a filled heap (6 of 6 with `HEAP_MB`), buffers eaten up to the limit (the Pod serves again within 30 s);
+- concurrency: 25 requests at once against a limit of 10 give exactly 10 answers and 15 times 429, another function still answers, a 429 carries `Retry-After`, and an answer that is still being streamed counts as in flight;
 - the warm cache: a heavy function answers at once from a read-only cache, an uncached module fails at once;
 - modern JavaScript: the versions, 17 language and runtime features, AES-GCM, and 7 npm packages imported dynamically.
 

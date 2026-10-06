@@ -94,6 +94,18 @@ t0=$(date +%s%N); req /hello/x; t1=$(date +%s%N)
 check "while one function burns the CPU, another answers at once (under 500 ms)" '[ "$CODE" = 200 ] && [ $(( (t1 - t0) / 1000000 )) -lt 500 ]'
 sleep 5
 check "a 200 MB response is served" 'req "/abuse?t=big"; [ "$CODE" = 200 ] && [ "${#BODY}" -ge 200000000 ]'
+step "Concurrency: requests in flight per function (MAX_CONCURRENT)"
+note "The memory of a function grows with the requests it is serving at once (rate times latency), not with the rate. The supervisor counts them per function and answers 429 (Retry-After: 1) over the limit; the rate (requests per second) is limited at the gateway."
+start -e MAX_CONCURRENT=10 -e IDLE_MS=60000 -e REQUEST_MS=10000 >/dev/null; curl -s -m 10 -o /dev/null "http://127.0.0.1:$port/sleepy/a"; curl -s -m 10 -o /dev/null "http://127.0.0.1:$port/hello/a"
+for i in $(seq 1 25); do ( curl -s -o /dev/null -w '%{http_code}\n' -m 20 "http://127.0.0.1:$port/sleepy/a" > "$work/c$i" ) & done
+sleep 0.5; req /hello/x; other=$CODE; wait
+n200=$(cat $work/c[0-9]* | grep -c '^200$'); n429=$(cat $work/c[0-9]* | grep -c '^429$'); rm -f $work/c[0-9]*
+check "25 requests at once for a function that sleeps 1.5 s, limit 10: exactly 10 are served, 15 get 429 ($n200 and $n429)" '[ "$n200" = 10 ] && [ "$n429" = 15 ]'
+check "while it is full, another function answers (200)" '[ "$other" = 200 ]'
+check "a 429 has Retry-After and the function is not touched; after the others finish, requests are served again" 'for i in $(seq 1 12); do ( curl -s -o /dev/null -m 20 "http://127.0.0.1:$port/sleepy/a" & ) ; done; sleep 0.4; req /sleepy/a; c=$CODE; printf %s "$HEADERS" | grep -qi "^retry-after: 1"; r=$?; sleep 3; req /sleepy/a; [ "$c" = 429 ] && [ $r = 0 ] && [ "$CODE" = 200 ]'
+check "an answer that is still being sent counts as in flight: 10 streams of 4 s fill the limit (their headers are long gone), the 11th gets 429, and a stream that has ended frees its place" 'for i in $(seq 1 10); do ( curl -s -o /dev/null -m 20 "http://127.0.0.1:$port/stream/a" & ) ; done; sleep 1.5; req /stream/a; c=$CODE; sleep 4; req /stream/a; [ "$c" = 429 ] && [ "$CODE" = 200 ]'
+sleep 5
+
 note "The supervisor gives every function process a V8 heap limit of its own (HEAP_MB, 192 MiB here). Left to Deno, each process takes about half of the Pod's memory as its limit, so the processes of one Pod add up to more than the Pod has and the kernel kills one first (in 6 runs the kernel killed a process every time, and once it killed the Pod itself)."
 survived=0; for i in 1 2 3 4 5 6; do start -e IDLE_MS=60000 -e REQUEST_MS=8000 >/dev/null; for f in hello echo; do curl -s -m 10 -o /dev/null "http://127.0.0.1:$port/$f/a"; done; req "/abuse?t=heap"; [ "$CODE" = 502 ] && [ "$(docker inspect -f '{{.State.OOMKilled}}' "${run}-fn")" = false ] && alive && survived=$((survived + 1)); done
 check "the V8 heap filled up: V8 stops that function (502), the kernel kills nothing, and the Pod and the next request are fine: $survived of 6 runs" '[ "$survived" = 6 ]'
