@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/koedodb/functions/internal/residents"
@@ -38,6 +39,11 @@ func New(cfg Config, logger *slog.Logger) (*Server, error) {
 		logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
 	}
 	if err := os.MkdirAll(cfg.Control, 0o700); err != nil {
+		return nil, err
+	}
+	// A function that runs out of heap aborts, and a core file of its whole address space (160 MB) would be written into the Pod's memory. The limit is inherited by the
+	// function processes, and with the hard limit at 0 they cannot raise it.
+	if err := syscall.Setrlimit(syscall.RLIMIT_CORE, &syscall.Rlimit{}); err != nil {
 		return nil, err
 	}
 	s := &Server{cfg: cfg, log: logger, inflight: map[string]*atomic.Int32{}}

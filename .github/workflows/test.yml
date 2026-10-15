@@ -14,5 +14,11 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - name: Run the function runtime (routing, sandbox, limits, modern JavaScript)
-        run: tests/run.sh
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Run the supervisor and the LRU of resident functions
+        run: go test -race ./...

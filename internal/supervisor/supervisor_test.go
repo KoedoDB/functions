@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -272,6 +273,21 @@ func TestAFunctionOverItsHeapLimitDiesAndTheNextRequestIsServedByAFreshProcess(t
 	}
 	if a := r.get("/die/ok"); a.status != 200 { // another function in the same Pod is not touched
 		t.Fatalf("%d", a.status)
+	}
+}
+
+func TestNoCoreFileIsWrittenWhenAFunctionAborts(t *testing.T) {
+	r := newRig(t, map[string]string{"heap": heapJS}, func(c *Config) { c.HeapMB = 64 })
+	var lim syscall.Rlimit
+	if err := syscall.Getrlimit(syscall.RLIMIT_CORE, &lim); err != nil || lim.Cur != 0 || lim.Max != 0 {
+		t.Fatalf("%v %v", lim, err)
+	}
+	t.Chdir(t.TempDir()) // where a core file would be written (core_pattern "core")
+	if a := r.get("/heap/"); a.status != 502 {
+		t.Fatalf("%d %q", a.status, a.body)
+	}
+	if cores, _ := filepath.Glob("core*"); len(cores) != 0 {
+		t.Fatalf("core files: %v", cores)
 	}
 }
 
