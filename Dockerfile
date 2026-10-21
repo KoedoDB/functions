@@ -4,7 +4,7 @@
 #
 # Run it as the Pod does: a non-root user, a read-only root file system, no capabilities; the bundles in /f (read-only), a tmpfs at /sockets (the sockets and scratch directories of the
 # function processes) and a disk emptyDir at /tmp (the functions' own scratch space).
-FROM golang:1.26.9-bookworm@sha256:d9c68c2c51161e12fd77e4c6320687c9cd86e1af1e3ad6e6cd63ff970641453c AS build
+FROM golang:1.26.10-bookworm@sha256:fe3da92a5cb2881e4aa75e625cb0b7c50571632fb4cf340cbe53e6ccdcffdd51 AS build
 WORKDIR /src
 COPY go.mod ./
 COPY cmd ./cmd
