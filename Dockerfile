@@ -11,8 +11,8 @@ COPY cmd ./cmd
 COPY internal ./internal
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/supervisor ./cmd/supervisor
 
-# node:24-bookworm-slim (Node 24 LTS). Check its advisories at each start of work (scripts/check-advisories of the KoedoDB repository).
-FROM node:24-bookworm-slim@sha256:d6aa754f16b3197301076f047b5def2f02ea1dbbc2ca920407d46d7ec7f87b20
+# node:24-bookworm-slim (Node 24 LTS; 24.22.1 of 2026-10-21, a security release). Check its advisories at each start of work (scripts/check-advisories of the KoedoDB repository).
+FROM node:24-bookworm-slim@sha256:55fb5f5a527ea2c5c4a95f963e48ef90aa38c7b346054fdc8ee9957a2b55d205
 COPY --from=build /out/supervisor /sup/supervisor
 COPY runner/runner.mjs /sup/runner.mjs
 USER 10001:10001
