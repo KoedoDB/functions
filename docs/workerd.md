@@ -5,19 +5,19 @@ The supervisor runs a customer's functions on the **unmodified** [workerd](https
 
 ## How it works
 
-- The functions are in `<FUNCTIONS_DIR>/<function>/index.mjs` (one customer: `default`), or, with `CUSTOMERS_DIR`, in `<CUSTOMERS_DIR>/<customer>/<function>/index.mjs` and the routes are
-  `/<customer>/<function>/...`. A customer's secrets are the variables named in `FN_ENV_ALLOW` and, with customers, the keys of `<customer>/secrets.json` on top of them.
-- On the first request of a customer the supervisor writes a configuration (`BuildWorkerdConfig`) and starts `workerd serve` with a clean environment: a router Worker that sends
-  `/<function>/<rest>` to the function's Worker as `/<rest>`, and a Worker for each function that wraps the bundle. The bundle's contract is a default export that is a function
-  `(request) => Response`, or an object with a `fetch` method, and `process.env` carries the allowed variables. workerd listens on a Unix socket; the supervisor proxies to it.
-- A bundle is imported at the first request, not when workerd starts: a bundle with no default export, or that throws when it loads, answers 500. A bundle that does **not load** (a syntax error, a module that is not there) would stop workerd
-  at its start and take the customer's other functions with it. There is no other JavaScript parser in the image, so workerd is the check: before a customer's process is started, a throwaway workerd is
-  started with the same configuration, no variables and no request but one to a name that is no function (so none of the customer's code runs), and it must still be there a moment after it answered. One
-  throwaway process for all the bundles not checked yet, and only when it fails one for each, to find the bad ones; a bad bundle is left out of the configuration and answers 502. A bundle that passed is
-  not checked again while its file stays the same (size and time), so the check costs about 0.4 s once for a customer's bundles after the supervisor has started or a bundle has changed.
+The supervisor is two parts, a spawner and a router, for a VM that holds several customers: [shared-vm.md](shared-vm.md). In short:
+
+- A customer is put through the spawner's control API: its functions (one `index.mjs` each), its secrets and its limits, all held in the spawner's memory. A throwaway workerd, as the customer's user, checks that
+  the bundles load before anything changes (a bundle that does not load is refused, 422, naming the function).
+- On the customer's first request the spawner writes a configuration (`internal/wdconfig`) and starts `workerd serve` as the customer's user, with a clean environment (only the secrets, as `FNSECRET_<NAME>`), a router
+  Worker that sends `/<function>/<rest>` to the function's Worker as `/<rest>`, and a Worker for each function that wraps the bundle. The bundle's contract is a default export that is a function
+  `(request, env) => Response`, or an object with a `fetch` method; `env` and `process.env` carry the customer's secrets (`fromEnvironment` bindings). The listening socket is made by the spawner and given to
+  workerd as file descriptor 3.
+- A bundle is imported at the first request, not when workerd starts: a bundle with no default export, or that throws when it loads, answers 500. A bundle that does **not load** (a syntax error, a module that is not
+  there) would stop workerd at its start and take the customer's other functions with it. There is no other JavaScript parser in the image, so workerd is the check: at the put, a throwaway workerd with the same configuration,
+  no secrets and no request but one to a name that is no function (so none of the customer's code runs); it must still be there a moment after it answered.
 - One workerd process serves all of a customer's functions: a request that runs over `REQUEST_MS` (504), or a process that dies (502), costs the customer's other requests in flight too. The next request starts
   a fresh process (cold start about 170 ms, measured). A process with no request for `IDLE_MS` is stopped; processes within the memory budget are an LRU (`internal/residents`).
-- The answers the supervisor gives itself: 404, 429 above `MAX_CONCURRENT` for a function, 503 with `Retry-After` when there is no room, 502, 504, and the `x-fn-ms` header.
 
 ## The limits, and where each comes from
 
@@ -29,44 +29,29 @@ workerd has no CPU time limit and no memory limit of its own (the limit enforcer
 | CPU (`WD_CPU_QUOTA_PCT`, 100) | `cpu.max`: a loop cannot use more than the quota | the Pod's CPU limit is the quota of the whole Pod |
 | A loop | `WD_RUNAWAY_LOOKS` (5) looks of `WD_LOOK_MS` (2 s) at 85% of the quota or more: killed with SIGKILL (a looping workerd does not see SIGTERM) after about **10 s**, using one core meanwhile | the same rule, from `/proc/<pid>/stat` |
 | Processes (`WD_PIDS`, 64) | `pids.max` | the Pod's limit |
-| Own user id (`WD_UID_BASE`) | each customer runs as `WD_UID_BASE + n` (the supervisor must be root) | not possible: the Pod has no `CAP_SETUID` |
+| Own user id (`UID_BASE`) | each customer runs as `UID_BASE + n` (the spawner is root with `CAP_SETUID` and `CAP_SETGID`) | the same: it does not depend on the cgroup |
 
 Measured with this layout on a host (systemd's units and cgroups instead of the supervisor's): 100 customers, 3 hours, about 24.5 MiB of cgroup memory for each running workerd (an idle one is about 50 MiB resident,
 15 MiB in its cgroup), cold start 167 ms median, a memory bomb stopped at the 256 MiB cgroup limit within 1.5 s, hostile neighbours never felt by the others.
 
-## Can the supervisor make cgroups and switch users inside a hardened Pod?
+## What the spawner needs from the guest
 
-**Not today, and the policy is not to weaken for it.** A Pod of ours runs as a non-root user with every capability dropped, a read-only root file system and no privilege escalation, and the guest that
-runs the containers of a microVM builds the container like this (`crates/agent/src/spec.rs` of `containerd-cloudhypervisor`):
+The spawner is root in its own container with four capabilities, `CAP_CHOWN`, `CAP_KILL`, `CAP_SETGID` and `CAP_SETUID`, and no more. The guest of a microVM (`crates/agent/src/spec.rs` of `containerd-cloudhypervisor`) allows
+these four in its list of capabilities a container may have (the list has no `CAP_SYS_ADMIN`, `CAP_MKNOD` or `CAP_SYS_PTRACE`) and sets `no_new_privs` on every container, which the tests run with. Pod admission (the KoedoDB
+workload policy) is where root and these four capabilities have to be allowed for the platform's own Functions Pod and for nothing else.
 
-- the mounts are the guest's own list: `/proc`, `/dev`, `/dev/pts`, `/dev/shm` and `/sys` as a **read-only sysfs**. There is **no cgroup file system** in the container (`/sys/fs/cgroup` is an empty directory of the
-  sysfs), and a volume cannot be mounted below `/sys` or `/proc`;
-- the namespaces are `mount` and `pid` only: no cgroup namespace and no user namespace (`user.max_user_namespaces` is 0);
-- the container's own cgroup is made with the Pod's memory, CPU and pids limits (so the Pod's limits are enforced), but nothing in it is writable by the container;
-- the capabilities are the Pod's, cut to a short list; the Pod drops all of them, so there is no `CAP_SETUID`, `CAP_SETGID` or `CAP_SYS_ADMIN`.
+What the guest does **not** give a container, and the spawner does not need: a cgroup file system (so no sub-cgroups: the looks are the limit, see the table), a user namespace, `CAP_SYS_ADMIN`.
 
-**Checked on 2026-10-23 in a Pod of that kind in a microVM** (non-root user 10001, all capabilities dropped, read-only root file system): `/sys/fs/cgroup` is an empty directory, `/proc/self/cgroup` shows only the
+**Checked on 2026-10-23 in a Pod of the old kind in a microVM** (non-root user 10001, all capabilities dropped, read-only root file system): `/sys/fs/cgroup` is an empty directory, `/proc/self/cgroup` shows only the
 container's own cgroup (`0::/<id>`), `/proc/mounts` has `sysfs ... ro` and no cgroup file system, `CapEff`, `CapPrm` and `CapBnd` are all 0, `mkdir /sys/fs/cgroup/x` fails, `max_user_namespaces` is 0.
 
-So inside such a Pod the supervisor cannot create sub-cgroups, move a process into one, or run a process as another user. What does work is everything this document calls "without a cgroup": the Pod's own
-limits, and the supervisor's looks at `/proc`. **For a Pod that holds one customer (the model of this repository today) that is complete**: the Pod is the customer's cgroup.
-
-For a VM that holds several customers, one of three things (with their risks):
-
-1. **(a) A second container of the Pod that is privileged inside the VM** (never on the host): it would need `CAP_SYS_ADMIN` and `CAP_SETUID`, which the admission policy forbids and the guest's allow list does not
-   contain, and a container with `CAP_SYS_ADMIN` in a VM that also runs customers' code can attack the guest kernel. Needs a policy exception, a larger guest attack surface. **Not recommended.**
-2. **(b) A small cgroup service in the guest agent** (root in the VM, already PID 1): the supervisor asks over a Unix socket for "a child cgroup with these limits" and for "start this process in it as
-   uid N"; the agent checks with `SO_PEERCRED` that the caller is in a container of the Pod and that the cgroup is below the caller's own cgroup (a child can only subdivide what its parent has, so no escape),
-   and returns a directory file descriptor (`WD_CGROUP_ROOT` is then that directory). Small, and the privilege stays in the code we already trust as PID 1, but it is new code in the agent and a new interface to review.
-   **This is what `WD_CGROUP_ROOT` and `WD_UID_BASE` are ready for.** Recommended for a VM with several customers.
-3. **(c) The VM boundary, the Pod's limits and the supervisor's looks only** (what is implemented): no new privilege. Customers in one VM share the guest kernel, the memory of the VM and one uid; the memory
-   rule can overshoot, one customer's bomb can make the guest's OOM killer choose another customer's process, and a loop costs up to 10 s of a core. Fine for a Pod with one customer; **not enough for
-   several customers in one VM**. `RLIMIT_AS` cannot help (V8 reserves address space), `RLIMIT_NPROC` is per user id (one uid for all), `RLIMIT_CPU` counts a process's whole life.
+For the kernel to enforce memory, CPU and processes per customer, the guest's agent can hand the spawner a **delegated cgroup v2 directory** (a small feature of the agent: a child cgroup below the container's own,
+with `cgroup.procs`, `cgroup.threads` and `cgroup.subtree_control` writable by the container and the controller files of that cgroup itself kept root-owned, so that it cannot raise its own limit); `WD_CGROUP_ROOT` is then that directory.
+That code path is unit-tested against a directory and has **not** run on a real delegated cgroup in a guest yet.
 
 ## Open points
 
-- The cgroup code path (`WD_CGROUP_ROOT`: `memory.max`, `cpu.max`, `pids.max`, a process cloned straight into its cgroup) is unit-tested against a directory and has not run on a real delegated cgroup yet; do that once (b) exists.
-- Customers in one VM need per-customer secrets and the uid switch (`WD_UID_BASE`, root); the secrets file is read by the supervisor and is in the configuration, which only the supervisor and workerd can read.
-- workerd's outbound `fetch` is workerd's default (public addresses). The network policy of the Pod is still what keeps a function away from other Pods and the node.
+- The cgroup code path (`WD_CGROUP_ROOT`: `memory.max`, `cpu.max`, `pids.max`, a process cloned straight into its cgroup) has not run on a real delegated cgroup yet.
+- workerd's outbound `fetch` is workerd's default (public addresses). The network policy of the Pod is what keeps a function away from other Pods and the node.
 - WebSockets and long-lived streams are not tested.
 - The image is about 220 MiB: Debian's slim base, the CA certificates, the supervisor (about 5 MB) and the official workerd binary (about 135 MB). Nothing else: no Node, no npm.

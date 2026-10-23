@@ -1,6 +1,6 @@
 # KoedoDB function runtime
 
-KoedoDB runs a project's functions (Supabase-style: one HTTP handler per function) on the unmodified [workerd](https://github.com/cloudflare/workerd), one process for each customer, with a small supervisor of its own, written in Go. This repository holds the supervisor, the image, and the tests.
+KoedoDB runs a project's functions (Supabase-style: one HTTP handler per function) on the unmodified [workerd](https://github.com/cloudflare/workerd), one process for each customer, **with several customers in one microVM**, under a small supervisor of our own written in Go. This repository holds the supervisor, the image, and the tests.
 
 This is not an official workerd, Cloudflare or Supabase repository, and KoedoDB is not affiliated with any of them.
 
@@ -9,68 +9,43 @@ This is not an official workerd, Cloudflare or Supabase repository, and KoedoDB 
 A function is **one JavaScript file** (ESM), `index.mjs`, that a customer bundles on their own computer or in their CI (esbuild, for example), with its dependencies inside. It exports a handler by default:
 
 ```js
-export default (req) => new Response('hello ' + new URL(req.url).pathname);
+export default (req, env) => new Response('hello ' + new URL(req.url).pathname + ' ' + env.API_KEY);
 ```
 
-The handler takes a standard `Request` and returns a `Response` (or a promise of one). An object with a `fetch` method works too (a Hono app, for one). A handler that throws, or does not return a `Response`, answers 500. A bundle that does not load stops its process, and the supervisor answers 502.
+The handler takes a standard `Request` and returns a `Response` (or a promise of one). An object with a `fetch` method works too (a Hono app, for one). `env.NAME` and `process.env.NAME` are the customer's secrets. A handler that throws, or does not return a `Response`, answers 500. A bundle that does not load is refused when the customer puts it (422).
 
-The bundles are in a directory, `<FUNCTIONS_DIR>/<name>/index.mjs`. A request for `/<name>/...` goes to that function.
+A request for `/<customer>/<function>/...` goes to that function.
 
 ## The supervisor
 
-`cmd/supervisor` listens on `:9000` and runs **one workerd process for each customer**, with all of the customer's functions in it, started on the customer's first request and stopped when it has been idle (`IDLE_MS`) or to make room for another. workerd listens on a Unix socket (a short path: 107 bytes at most). The supervisor is trusted platform code; the functions are not. A customer's process gets:
+One binary, `/sup/supervisor`, two containers of a Pod (**[docs/shared-vm.md](docs/shared-vm.md)** has all of this in detail):
 
-- a clean environment: the variables a function may read (`FN_ENV_ALLOW`, and a customer's own `secrets.json`) are in its configuration and nowhere else;
-- limits applied from outside, because workerd has no CPU time limit and no memory limit of its own: its resident memory is looked at every `WD_MEMORY_LOOK_MS` and it is killed above `WD_MEMORY_MIB` (256), and a process that uses nearly all of its CPU quota for `WD_RUNAWAY_LOOKS` looks of `WD_LOOK_MS` (about 10 s) is killed too (SIGKILL: a looping workerd ignores SIGTERM); with a cgroup (`WD_CGROUP_ROOT`) the kernel enforces memory, CPU and processes as well. `docs/workerd.md` says which limit comes from where, and what a hardened Pod can and cannot do;
-- no core files: the supervisor sets `RLIMIT_CORE` to 0.
+- **`spawner`**: root with `CAP_CHOWN`, `CAP_KILL`, `CAP_SETGID` and `CAP_SETUID` and nothing else. The only part that holds the customers' bundles and secrets (in memory) and starts workerd, **each customer's process as a user and group of its own**, with no groups, no capabilities and `no_new_privs`, a read-only and empty directory, its listening socket handed down as a file descriptor, its secrets in its own environment only, and limits from outside. Its doors: a **control API** (HTTPS, mutual TLS) to put and delete a customer, and a Unix socket only the router's user can open.
+- **`router`**: an ordinary user (10001), no capability, holds nothing. Routes `/<customer>/<function>/...`, counts, limits, answers 404, 429, 502, 503 and 504.
 
-The answers the supervisor gives itself:
+```
+PUT /v1/customers/<id>   {"functions": {"hello": {"bundle": "<base64 index.mjs>"}}, "secrets": {"API_KEY": "…"}, "limits": {"memory_mib": 128}}
+```
 
-| Status | When |
-|---|---|
-| 404 | no such function (a bad name, or no bundle) |
-| 429 | a function already serves `MAX_CONCURRENT` requests (with `Retry-After`) |
-| 503 | there is no room within `FN_WAIT_MS` to start the customer's process (with `Retry-After`) |
-| 502 | the process did not start or died, or the bundle does not load |
-| 504 | a request took longer than `REQUEST_MS`; the customer's process is killed (the next request starts a new one) |
+A put replaces the customer's whole definition and is checked first (a throwaway workerd as the customer's user): a bundle that does not load is refused with the function's name and nothing changes. A new definition is a new generation: the next request uses it and the old process finishes what it serves.
+
+### Limits
+
+workerd has no CPU time limit and no memory limit of its own, so they come from outside the process: the spawner looks at each process (`WD_MEMORY_LOOK_MS`: resident memory above `WD_MEMORY_MIB`, 256, is killed; `WD_RUNAWAY_LOOKS` looks of `WD_LOOK_MS` at 85 % of the CPU quota, about 10 s, is killed: SIGKILL, because a looping workerd ignores SIGTERM), `RLIMIT_NPROC` (per user, so the customer's own), no core files, and, with a delegated cgroup (`WD_CGROUP_ROOT`), the kernel enforces `memory.max`, `cpu.max` and `pids.max` too. `docs/workerd.md` says which limit comes from where.
 
 ### Memory: the LRU of resident processes
 
-`internal/residents` keeps the customers' processes that are resident within a **memory budget** (`FN_BUDGET_MIB`, else the container's cgroup limit less `SUPERVISOR_RESERVE_MIB`). A process counts as the larger of its measured resident memory and `FN_ESTIMATE_MIB` (so a process that has just started does not look small). When a function needs room, the least recently used process that is idle is stopped (not before `FN_MIN_RESIDENCY_MS`); a function with a request in flight is never stopped. Requests for functions that cannot start yet wait (up to `FN_WAIT_MS`, at most `FN_MAX_WAITERS` of them), in order; then 503.
+`internal/residents` keeps the customers' processes that are resident within a **memory budget** (`FN_BUDGET_MIB`, else the container's cgroup limit less `SUPERVISOR_RESERVE_MIB`). A process counts as the larger of its measured resident memory and `FN_ESTIMATE_MIB` (so a process that has just started does not look small). When a function needs room, the least recently used process that is idle is stopped (not before `FN_MIN_RESIDENCY_MS`); a customer with a request in flight is never stopped. Requests that cannot start yet wait (up to `FN_WAIT_MS`, at most `FN_MAX_WAITERS` of them), in order; then 503.
 
-The supervisor itself takes about 10 MiB.
+The spawner takes about 17 MiB and the router about 13 MiB resident (measured, two customers put).
+
+## What it does not do
+
+[docs/shared-vm.md](docs/shared-vm.md) ends with "Security properties, and what is not guaranteed". The short version: the guest's kernel is shared by every customer in the VM; there is no PID or mount namespace (that would need `CAP_SYS_ADMIN`); the network is the Pod's NetworkPolicy's job; the CPU and memory limits are looks (a cgroup makes them the kernel's); the state is in memory and the Regional Agent puts the customers again after a restart; WebSockets and long-lived streams are not tested.
 
 ## Settings
 
-All by environment variables; a value that is not a number is an error at start.
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `FUNCTIONS_DIR` | `/f` | where the bundles are |
-| `CONTROL_DIR` | `/sockets` | sockets and scratch directories of the processes (a tmpfs of their own) |
-| `LISTEN` | `:9000` | address |
-| `IDLE_MS` | 30000 | stop a process with no request for this long |
-| `REQUEST_MS` | 10000 | cancel a request (504) and kill its process |
-| `START_MS` | 30000 | how long to wait for a process to listen |
-| `MAX_CONCURRENT` | 20 | requests one function serves at once |
-| `FN_ENV_ALLOW` | | comma-separated names a function may read |
-| `FN_BUDGET_MIB` | cgroup limit less the reserve | memory the processes may use together |
-| `SUPERVISOR_RESERVE_MIB` | 30 | what the supervisor takes of the Pod |
-| `FN_ESTIMATE_MIB` | 50 | what a process counts as before it is measured |
-| `FN_MIN_RESIDENCY_MS` | 1000 | a process is not stopped to make room before this |
-| `FN_WAIT_MS` | 5000 | how long a request waits for room |
-| `FN_MAX_WAITERS` | 20 | how many may wait |
-| `WORKERD_BIN` | `/sup/workerd` | the workerd executable (the image has the official release) |
-| `CUSTOMERS_DIR` | | `<dir>/<customer>/<function>/index.mjs`, routes `/<customer>/<function>/...`; empty: one customer, `default`, with `FUNCTIONS_DIR` |
-| `WD_COMPAT_DATE` | `2026-10-01` | the compatibility date of every function |
-| `WD_MEMORY_MIB` | 256 | a process above this resident memory is killed (and `memory.max` of its cgroup) |
-| `WD_CPU_QUOTA_PCT` | 100 | the CPU a process may use, % of one core (`cpu.max`; and what "nearly all" means to the runaway rule) |
-| `WD_LOOK_MS` | 2000 | one look at the CPU |
-| `WD_RUNAWAY_LOOKS` | 5 | looks in a row at 85% of the quota or more before the process is killed (5 x 2 s = about 10 s) |
-| `WD_MEMORY_LOOK_MS` | 250 | how often the resident memory is read |
-| `WD_PIDS` | 64 | `pids.max` of the cgroup |
-| `WD_CGROUP_ROOT` | | a writable cgroup v2 directory; each customer's process gets a cgroup in it |
-| `WD_UID_BASE`, `WD_UID_COUNT` | 0, 4096 | workerd: customer n runs as `WD_UID_BASE + n` (the supervisor must be root); 0: no switch |
+All by environment variables, in [docs/shared-vm.md](docs/shared-vm.md#settings). A value that is not a number is an error at start; the control API's certificates and the users of the customers have no default that works without them.
 
 ## The image
 
@@ -81,24 +56,18 @@ scripts/image-test.sh koedodb-functions
 
 The image is Debian's slim base (pinned by digest), `ca-certificates` (workerd aborts at start without the system's certificates), the supervisor, and the official `workerd` binary: about 220 MiB, no Node, no npm. The binary comes from the npm package at the version and integrity hashes of `workerd/package-lock.json`, in a builder stage that is not in the image; `docker build` runs `workerd --version` so that it stops when the binary does not run on the base's glibc.
 
-Run it as the Pod does: a non-root user (10001), a read-only root file system, no capabilities. **The only writable place is a tmpfs at `/sockets`** (the sockets, configurations and scratch directories of the customers' processes; the supervisor makes the directories below it, so the tmpfs must be writable by user 10001: `uid=10001,mode=0700`). The bundles are read-only, at `/f` (one customer) or below `CUSTOMERS_DIR` (many). `scripts/image-test.sh` runs the image like that and tries a loop and a memory bomb.
+`scripts/image-test.sh` runs the image as the Pod does: two containers (the spawner as root with exactly four capabilities, `no-new-privileges` and a read-only root file system; the router as user 10001 with none), sharing a network and a tmpfs, with mutual TLS on the control API. It puts two customers, checks the wall between them (as one customer's user: the sockets directory, the state directory, the neighbour's environment and process), a loop, a memory bomb, and a delete.
 
 To update workerd, change `workerd/package.json`, run `npm install --package-lock-only --ignore-scripts` there, and read the [release notes](https://github.com/cloudflare/workerd/releases) and [security advisories](https://github.com/cloudflare/workerd/security/advisories) first.
-
-## What the limits do not do
-
-- **The network is not restricted by workerd.** A function can reach `127.0.0.1`, the node, other Pods. NetworkPolicy has to keep it away from other projects, the node and the metadata address.
-- **A memory bomb can overshoot** between two looks at the resident memory (a process fills hundreds of MiB in a second); the Pod's own limit is the last line.
-- WebSocket and server-sent events are not supported (the supervisor proxies whole HTTP exchanges); not tested.
-- **The wall is the Pod** (a microVM): one Pod holds one project today, and only secrets that project's functions may read. Several customers in one VM need a cgroup and a user id for each (`docs/workerd.md`).
 
 ## Tests
 
 ```
-go vet ./... && go test -race ./...
+go vet ./... && go test -race ./...          # unit tests; the integration tests are skipped without root and a workerd
+scripts/test-in-docker.sh                    # all of them, as the Pod runs the code (needs docker)
 ```
 
-With `WORKERD_BIN` (or `workerd` on the PATH) the tests that run a real workerd run too (the official binary: `cd workerd && npm ci --ignore-scripts`); they are skipped without it. They check, among others: routing (path, query, method, headers, body), the life cycle (nothing runs before the first request, idle stop, restart), a clean environment, the check of the bundles (a bad bundle is left out and the customer's other functions run), the limits (a loop is stopped by the looks and the neighbour never feels it, a memory bomb is killed at the limit, 429, 504, 503 with `Retry-After`), the settings, and the LRU (budget, order, in-flight processes are never stopped, waiting and the queue limit). `scripts/image-test.sh` tests the image.
+`scripts/test-in-docker.sh` builds the tests with the race detector and runs them in the image, as root with `--cap-drop ALL --cap-add CHOWN --cap-add KILL --cap-add SETGID --cap-add SETUID`, a read-only root file system and `no-new-privileges`: 60 tests, among them the wall between two customers (fourteen things one customer cannot do to another, each refused by the kernel), a hundred customers in one VM (no wrong answer, the pool making room), secrets (not on disk, not in the log, not in a command line), the control API (no certificate, another CA, another name, TLS 1.2, no TLS), the internal socket, puts that do not load, a new generation draining the old, delete, a loop stopped in about ten seconds with the neighbour never feeling it, a memory bomb, an overrun, an idle stop. The unit tests need no root: the settings, the limits, the route, the configuration, the router against a fake spawner, and the LRU.
 
 ## License
 

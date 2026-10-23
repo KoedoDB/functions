@@ -2,9 +2,9 @@
 #
 #   docker build -t koedodb-functions .
 #
-# Run it as the Pod does: a non-root user, a read-only root file system, no capabilities. What must be writable is a tmpfs at /sockets (the Unix sockets, configurations and scratch
-# directories of the customers' workerd processes; the supervisor makes the directories below it), and nothing else: the bundles are read-only at /f (or /c/<customer>/<function> with
-# CUSTOMERS_DIR). The image has no Node, no npm and no shell tools of its own beyond what the base image has.
+# One image, two containers of a Pod (docs/shared-vm.md): `spawner` runs as root with CAP_CHOWN, CAP_KILL, CAP_SETGID and CAP_SETUID and nothing else, `router` as user 10001 with no
+# capability. Both have a read-only root file system; the spawner needs /state (its own tmpfs) and /sockets (a tmpfs shared with the router), the router only /sockets. The image has no Node,
+# no npm and no shell tools of its own beyond what the base image has.
 FROM golang:1.26.10-bookworm@sha256:fe3da92a5cb2881e4aa75e625cb0b7c50571632fb4cf340cbe53e6ccdcffdd51 AS build
 WORKDIR /src
 COPY go.mod ./
@@ -32,7 +32,7 @@ COPY --from=workerd /w/node_modules/@cloudflare/workerd-linux-64/bin/workerd /su
 # The official binary needs glibc 2.31 or more (this base has 2.36): the build stops here if it does not run.
 RUN /sup/workerd --version
 ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
-USER 10001:10001
-ENV FUNCTIONS_DIR=/f CONTROL_DIR=/sockets LISTEN=:9000
-EXPOSE 9000
+# No USER: the Pod sets it for each container (the spawner 0, the router 10001). The mode is the argument: `spawner` or `router`.
+ENV CONTROL_DIR=/sockets STATE_DIR=/state
+EXPOSE 9000 9443
 ENTRYPOINT ["/sup/supervisor"]

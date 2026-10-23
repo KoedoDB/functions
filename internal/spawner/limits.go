@@ -1,20 +1,18 @@
-package supervisor
+package spawner
 
-// The limits of a customer's workerd process, applied from outside (workerd.go): what the supervisor looks at, the rule that decides, and the cgroup when there is one.
+// The limits of a customer's workerd process, applied from outside (launcher.go): what the supervisor looks at, the rule that decides, and the cgroup when there is one.
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
-)
 
-var envNameRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,63}$`)
+	"github.com/koedodb/functions/internal/wdconfig"
+)
 
 // sampler is what the limits are decided from.
 type sampler interface {
@@ -157,7 +155,7 @@ func isCgroup2(dir string) bool {
 // newCgroup makes the cgroup of a customer and sets its limits: memory.max (and no swap), cpu.max (quotaPct of one core in a period of 100 ms) and pids.max. A file that is not
 // there (a controller that is not enabled in the parent) is an error for memory.max, cpu.max and pids.max: a limit that is not applied must not look as if it were.
 func newCgroup(root, customer string, memoryMiB, quotaPct float64, pids int) (*cgroup, error) {
-	if !nameRE.MatchString(customer) {
+	if !wdconfig.NameRE.MatchString(customer) {
 		return nil, fmt.Errorf("%q is not a customer name", customer)
 	}
 	dir := filepath.Join(root, "wd-"+customer)
@@ -189,24 +187,3 @@ func newCgroup(root, customer string, memoryMiB, quotaPct float64, pids int) (*c
 
 // remove removes the directory (the process is gone).
 func (c *cgroup) remove() { _ = os.Remove(c.dir) }
-
-// readSecrets reads a customer's secrets.json: an object of names and string values. A file that is not there is no secret; a name that is not a variable name is an error.
-func readSecrets(path string) (map[string]string, error) {
-	b, err := os.ReadFile(path)
-	if os.IsNotExist(err) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	var m map[string]string
-	if err := json.Unmarshal(b, &m); err != nil {
-		return nil, fmt.Errorf("%s: %w", path, err)
-	}
-	for k := range m {
-		if !envNameRE.MatchString(k) {
-			return nil, fmt.Errorf("%s: %q is not a variable name", path, k)
-		}
-	}
-	return m, nil
-}
