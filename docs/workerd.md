@@ -1,20 +1,23 @@
-# The workerd runtime
+# How the functions run
 
-`RUNTIME=workerd` runs a customer's functions on the **unmodified** [workerd](https://github.com/cloudflare/workerd), **one workerd process for each customer**, all of that customer's functions
-(Workers) in it. The limits that workerd does not have are applied from outside the process. The default, `RUNTIME=node`, is unchanged: a Node process for each function (README).
+The supervisor runs a customer's functions on the **unmodified** [workerd](https://github.com/cloudflare/workerd), **one workerd process for each customer**, all of that customer's functions
+(Workers) in it. It is the only runtime. The limits that workerd does not have are applied from outside the process.
 
 ## How it works
 
 - The functions are in `<FUNCTIONS_DIR>/<function>/index.mjs` (one customer: `default`), or, with `CUSTOMERS_DIR`, in `<CUSTOMERS_DIR>/<customer>/<function>/index.mjs` and the routes are
   `/<customer>/<function>/...`. A customer's secrets are the variables named in `FN_ENV_ALLOW` and, with customers, the keys of `<customer>/secrets.json` on top of them.
 - On the first request of a customer the supervisor writes a configuration (`BuildWorkerdConfig`) and starts `workerd serve` with a clean environment: a router Worker that sends
-  `/<function>/<rest>` to the function's Worker as `/<rest>`, and a Worker for each function that wraps the bundle. The bundle has the same contract as in the Node runtime (a default export that is a function
-  `(request) => Response`, or an object with a `fetch` method), and `process.env` carries the allowed variables. workerd listens on a Unix socket; the supervisor proxies to it.
-- A bundle is imported at the first request, not when workerd starts: a bundle with no default export, or that throws when it loads, answers 500. A bundle that does **not parse** would stop workerd
-  at its start and take the customer's other functions with it, so with Node present each bundle is parsed first (`node --check`) and one that does not parse is left out of the configuration and answers 502.
+  `/<function>/<rest>` to the function's Worker as `/<rest>`, and a Worker for each function that wraps the bundle. The bundle's contract is a default export that is a function
+  `(request) => Response`, or an object with a `fetch` method, and `process.env` carries the allowed variables. workerd listens on a Unix socket; the supervisor proxies to it.
+- A bundle is imported at the first request, not when workerd starts: a bundle with no default export, or that throws when it loads, answers 500. A bundle that does **not load** (a syntax error, a module that is not there) would stop workerd
+  at its start and take the customer's other functions with it. There is no other JavaScript parser in the image, so workerd is the check: before a customer's process is started, a throwaway workerd is
+  started with the same configuration, no variables and no request but one to a name that is no function (so none of the customer's code runs), and it must still be there a moment after it answered. One
+  throwaway process for all the bundles not checked yet, and only when it fails one for each, to find the bad ones; a bad bundle is left out of the configuration and answers 502. A bundle that passed is
+  not checked again while its file stays the same (size and time), so the check costs about 0.4 s once for a customer's bundles after the supervisor has started or a bundle has changed.
 - One workerd process serves all of a customer's functions: a request that runs over `REQUEST_MS` (504), or a process that dies (502), costs the customer's other requests in flight too. The next request starts
-  a fresh process (cold start about 170 ms, measured). A process with no request for `IDLE_MS` is stopped; processes within the memory budget are an LRU, as in the Node runtime (`internal/residents`).
-- The answers are the Node runtime's: 404, 429 above `MAX_CONCURRENT` for a function, 503 with `Retry-After` when there is no room, 502, 504, and the `x-fn-ms` header.
+  a fresh process (cold start about 170 ms, measured). A process with no request for `IDLE_MS` is stopped; processes within the memory budget are an LRU (`internal/residents`).
+- The answers the supervisor gives itself: 404, 429 above `MAX_CONCURRENT` for a function, 503 with `Retry-After` when there is no room, 502, 504, and the `x-fn-ms` header.
 
 ## The limits, and where each comes from
 
@@ -66,4 +69,4 @@ For a VM that holds several customers, one of three things (with their risks):
 - Customers in one VM need per-customer secrets and the uid switch (`WD_UID_BASE`, root); the secrets file is read by the supervisor and is in the configuration, which only the supervisor and workerd can read.
 - workerd's outbound `fetch` is workerd's default (public addresses). The network policy of the Pod is still what keeps a function away from other Pods and the node.
 - WebSockets and long-lived streams are not tested.
-- The image holds both runtimes (the official workerd binary is about 140 MB): an image for one runtime only is a build argument away if the size matters.
+- The image is about 220 MiB: Debian's slim base, the CA certificates, the supervisor (about 5 MB) and the official workerd binary (about 135 MB). Nothing else: no Node, no npm.

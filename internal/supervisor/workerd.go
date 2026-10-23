@@ -1,6 +1,6 @@
 package supervisor
 
-// The workerd runtime: ONE workerd process for each customer, all of the customer's functions in it (RUNTIME=workerd).
+// The workerd processes: ONE workerd process for each customer, all of the customer's functions in it.
 //
 // The unmodified workerd has no CPU time limit and no memory limit of its own, so the limits come from outside the process: a cgroup (memory.max, cpu.max, pids.max) when the supervisor
 // has a writable cgroup v2 directory (WD_CGROUP_ROOT), and always the supervisor's own looks every WD_LOOK_MS at the process (limits.go): resident memory above WD_MEMORY_MIB, or nearly
@@ -46,7 +46,7 @@ export default {
 };
 `
 
-// wrapperJS turns the bundle of a function (export default (request) => Response, or an object with a fetch method: the contract of the Node runtime) into a Worker. The bundle is
+// wrapperJS turns the bundle of a function (export default (request) => Response, or an object with a fetch method: the contract of a function) into a Worker. The bundle is
 // imported when the first request comes, not when workerd starts: a bundle with no default export is an exception of that request (500), not the end of the customer's process.
 const wrapperJS = `let loading;
 function load() {
@@ -184,36 +184,195 @@ func BuildWorkerdConfig(sp WorkerdSpec) (string, error) {
 	return b.String(), nil
 }
 
-// checkBundles parses each bundle with `node --check`; it returns the reason for each one that does not parse. Without Node nothing is checked.
-func (l *wlauncher) checkBundles(dir string, names []string) map[string]string {
-	bad := map[string]string{}
-	node, err := exec.LookPath(l.cfg.Node)
+// bundleKey is a bundle as the file system tells it: a bundle that has changed is checked again.
+type bundleKey struct {
+	path  string
+	size  int64
+	mtime int64
+}
+
+func keyOf(path string) (bundleKey, bool) {
+	st, err := os.Stat(path)
 	if err != nil {
+		return bundleKey{}, false
+	}
+	return bundleKey{path: path, size: st.Size(), mtime: st.ModTime().UnixNano()}, true
+}
+
+// checkBundles tells which of the bundles workerd would not accept (a syntax error, a module that does not exist): it returns the reason for each. workerd compiles every module when it
+// starts and stops at the first one it cannot, so one bad bundle would take the customer's other functions down with it. There is no other parser in the image, so workerd itself is the
+// check: a throwaway process with the same configuration, no variables, and no request (the bundles are imported when a request comes, so none of the customer's code runs). One
+// process for all the bundles that have not been checked yet; only when it fails, one for each, to find the bad ones. A bundle that passed is not checked again while its file stays the same.
+func (l *wlauncher) checkBundles(customer, dir string, names []string) map[string]string {
+	bad := map[string]string{}
+	var todo []string
+	keys := map[string]bundleKey{}
+	l.mu.Lock()
+	for _, n := range names {
+		k, ok := keyOf(filepath.Join(dir, n, "index.mjs"))
+		if !ok || !l.good[k] {
+			todo = append(todo, n)
+			keys[n] = k
+		}
+	}
+	l.mu.Unlock()
+	if len(todo) == 0 {
+		return bad
+	}
+	mark := func(n string) {
+		l.mu.Lock()
+		if l.good == nil {
+			l.good = map[bundleKey]bool{}
+		}
+		l.good[keys[n]] = true
+		l.mu.Unlock()
+	}
+	if err := l.probe(customer, dir, todo); err == nil {
+		for _, n := range todo {
+			mark(n)
+		}
 		return bad
 	}
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, 4)
-	for _, n := range names {
+	for _, n := range todo {
 		wg.Add(1)
 		sem <- struct{}{}
 		go func(n string) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-			out, err := exec.CommandContext(ctx, node, "--check", filepath.Join(dir, n, "index.mjs")).CombinedOutput()
-			if err != nil {
-				first, _, _ := strings.Cut(strings.TrimSpace(string(out)), "\n")
-				l.log.Warn("a bundle does not parse and is left out", "function", n, "output", first)
+			if err := l.probe(customer, dir, []string{n}); err != nil {
+				l.log.Warn("a bundle does not load and is left out", "customer", customer, "function", n, "output", err.Error())
 				mu.Lock()
-				bad[n] = "does not parse"
+				bad[n] = "does not load"
 				mu.Unlock()
+				return
 			}
+			mark(n)
 		}(n)
 	}
 	wg.Wait()
 	return bad
+}
+
+// probe starts a throwaway workerd with the given functions and says whether it came up: it listens on its socket within a few seconds (it is stopped at once), or it stops by itself
+// and the first line of what it said is the error.
+func (l *wlauncher) probe(customer, dir string, names []string) error {
+	l.mu.Lock()
+	l.probes++
+	id := l.probes
+	l.mu.Unlock()
+	work := filepath.Join(l.cfg.Control, "wp-"+strconv.Itoa(id))
+	sock := work + ".sock"
+	if err := os.MkdirAll(work, 0o700); err != nil {
+		return err
+	}
+	defer os.RemoveAll(work)
+	defer os.Remove(sock)
+	fns := make([]WorkerdFunction, 0, len(names))
+	for _, n := range names {
+		fns = append(fns, WorkerdFunction{Name: n, Bundle: filepath.Join(dir, n, "index.mjs")})
+	}
+	text, err := BuildWorkerdConfig(WorkerdSpec{Base: work, Socket: sock, CompatDate: l.cfg.CompatDate, Functions: fns})
+	if err != nil {
+		return err
+	}
+	cfgPath := filepath.Join(work, "config.capnp")
+	if err := os.WriteFile(cfgPath, []byte(text), 0o600); err != nil {
+		return err
+	}
+	var out limitedBuffer
+	cmd := exec.Command(l.cfg.Workerd, "serve", cfgPath)
+	cmd.Dir = work
+	cmd.Env = []string{}
+	cmd.Stdout, cmd.Stderr = &out, &out
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if l.uids != nil { // the same user as the customer's process: the probe reads the bundles as the process will
+		uid, err := l.uids.uid(customer)
+		if err != nil {
+			return err
+		}
+		_ = os.Chown(work, uid, uid)
+		_ = os.Chown(cfgPath, uid, uid)
+		cmd.SysProcAttr.Credential = &syscall.Credential{Uid: uint32(uid), Gid: uint32(uid)}
+	}
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	exited := make(chan struct{})
+	go func() { _ = cmd.Wait(); close(exited) }()
+	stop := func() {
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		<-exited
+	}
+	timeout := l.cfg.StartTimeout
+	if timeout > 10*time.Second {
+		timeout = 10 * time.Second
+	}
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		select {
+		case <-exited:
+			first, _, _ := strings.Cut(strings.TrimSpace(out.String()), "\n")
+			return errors.New(first)
+		default:
+		}
+		if c, err := net.DialTimeout("unix", sock, 100*time.Millisecond); err == nil {
+			_ = c.Close()
+			// workerd opens its socket BEFORE it has made the services, and stops (with the error of the bundle) a moment later: ask the router for a name that is no function (404, and no
+			// code of the customer runs), then look once more. Only a process that answered and is still there a moment after it has come up.
+			client := &http.Client{Timeout: 3 * time.Second, Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, "unix", sock)
+			}, DisableKeepAlives: true}}
+			resp, gerr := client.Get("http://probe/__probe__/")
+			if gerr == nil {
+				_ = resp.Body.Close()
+			}
+			select {
+			case <-exited:
+			case <-time.After(300 * time.Millisecond):
+				if gerr == nil {
+					stop()
+					return nil
+				}
+				stop()
+				return gerr
+			}
+			first, _, _ := strings.Cut(strings.TrimSpace(out.String()), "\n")
+			if first == "" && gerr != nil {
+				first = gerr.Error()
+			}
+			return errors.New(first)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	stop()
+	return errors.New("workerd did not come up")
+}
+
+// limitedBuffer keeps the first 4 KiB of what a throwaway process says.
+type limitedBuffer struct {
+	mu sync.Mutex
+	b  []byte
+}
+
+func (l *limitedBuffer) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if room := 4096 - len(l.b); room > 0 {
+		if len(p) < room {
+			room = len(p)
+		}
+		l.b = append(l.b, p[:room]...)
+	}
+	return len(p), nil
+}
+
+func (l *limitedBuffer) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return string(l.b)
 }
 
 // rel is path relative to base (workerd reads "embed" paths relative to the configuration file: "..", symbolic links and relative paths work; an absolute path does not).
@@ -267,6 +426,8 @@ type wlauncher struct {
 	sampler func(p *WProc) sampler
 	mu      sync.Mutex
 	starts  int
+	probes  int
+	good    map[bundleKey]bool // bundles a throwaway workerd has accepted (checkBundles)
 }
 
 func (l *wlauncher) customerDir(customer string) string {
@@ -311,9 +472,8 @@ func (l *wlauncher) start(customer string) (*WProc, error) {
 	if err != nil {
 		return nil, err
 	}
-	// A bundle that does not parse stops workerd at its start, and with it every other function of the customer: it is left out, and answers 502. (Node's --check parses an ES module
-	// without running it; without Node the bundles are not checked.)
-	bad := l.checkBundles(dir, names)
+	// A bundle that does not load stops workerd at its start, and with it every other function of the customer: it is left out, and answers 502 (checkBundles).
+	bad := l.checkBundles(customer, dir, names)
 	fns := make([]WorkerdFunction, 0, len(names))
 	for _, n := range names {
 		if bad[n] == "" {
@@ -524,7 +684,7 @@ func (s *Server) route(path string) (customer, name, rest string, ok bool) {
 	return customer, name, rest, nameRE.MatchString(customer) && nameRE.MatchString(name)
 }
 
-// serveWorkerd is ServeHTTP of the workerd runtime: the same answers as the Node runtime (README, "The supervisor"), the process being the customer's.
+// serveWorkerd is ServeHTTP of the workerd runtime: the answers are in the README ("The supervisor"), the process being the customer's.
 func (s *Server) serveWorkerd(w http.ResponseWriter, r *http.Request, t0 time.Time) {
 	customer, name, rest, ok := s.route(r.URL.Path)
 	if !ok {

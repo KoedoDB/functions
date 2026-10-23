@@ -261,25 +261,27 @@ func TestSecretsOfACustomerAreReadFromItsFileAndAMistakeIsAnError(t *testing.T) 
 	}
 }
 
-func TestTheWorkerdSettingsAreReadAndATypoIsAnError(t *testing.T) {
+func TestTheSettingsAreReadAndATypoIsAnError(t *testing.T) {
 	env := func(m map[string]string) func(string) (string, bool) {
 		return func(k string) (string, bool) { v, ok := m[k]; return v, ok }
 	}
 	none := func() (float64, bool) { return 0, false }
-	c, err := ConfigFromEnv(env(map[string]string{"RUNTIME": "workerd"}), none)
+	c, err := ConfigFromEnv(env(nil), none)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Runtime != "workerd" || c.MemoryLook != 250*time.Millisecond || c.MemoryMiB != 256 || c.CPUQuotaPct != 100 || c.Look != 2*time.Second || c.RunawayLooks != 5 || c.EstimateMiB != 50 || c.PidsLimit != 64 || c.Workerd != "/sup/workerd" {
+	if c.Functions != "/f" || c.Control != "/sockets" || c.MaxConcurrent != 20 || c.RequestTimeout != 10*time.Second || c.BudgetMiB != 330 ||
+		c.MemoryLook != 250*time.Millisecond || c.MemoryMiB != 256 || c.CPUQuotaPct != 100 || c.Look != 2*time.Second || c.RunawayLooks != 5 || c.EstimateMiB != 50 || c.PidsLimit != 64 || c.Workerd != "/sup/workerd" {
 		t.Errorf("defaults: %+v", c)
 	}
-	if c, _ = ConfigFromEnv(env(map[string]string{"RUNTIME": "workerd", "FN_ESTIMATE_MIB": "80", "WD_MEMORY_MIB": "128"}), none); c.EstimateMiB != 80 || c.MemoryMiB != 128 {
-		t.Errorf("given: %+v", c)
+	if c, _ = ConfigFromEnv(env(nil), func() (float64, bool) { return 384, true }); c.BudgetMiB != 354 {
+		t.Errorf("the Pod's limit less the supervisor's 30: %v", c.BudgetMiB)
 	}
-	if c, _ = ConfigFromEnv(env(nil), none); c.Runtime != "node" || c.EstimateMiB != 105 {
-		t.Errorf("the default runtime is node: %+v", c)
+	given := map[string]string{"FN_ESTIMATE_MIB": "80", "WD_MEMORY_MIB": "128", "FN_BUDGET_MIB": "200", "FN_ENV_ALLOW": " A, B ,,C", "RUNTIME": "workerd"}
+	if c, err = ConfigFromEnv(env(given), none); err != nil || c.EstimateMiB != 80 || c.MemoryMiB != 128 || c.BudgetMiB != 200 || !slices.Equal(c.EnvAllow, []string{"A", "B", "C"}) {
+		t.Errorf("given: %+v %v", c, err)
 	}
-	for _, bad := range []map[string]string{{"RUNTIME": "deno"}, {"RUNTIME": "workerd", "WD_MEMORY_MIB": "0"}, {"RUNTIME": "workerd", "WD_RUNAWAY_LOOKS": "x"}, {"RUNTIME": "workerd", "WD_UID_BASE": "10", "WD_UID_COUNT": "0"}} {
+	for _, bad := range []map[string]string{{"RUNTIME": "node"}, {"RUNTIME": "deno"}, {"WD_MEMORY_MIB": "0"}, {"WD_RUNAWAY_LOOKS": "x"}, {"MAX_CONCURRENT": "twenty"}, {"WD_UID_BASE": "10", "WD_UID_COUNT": "0"}} {
 		if _, err := ConfigFromEnv(env(bad), none); err == nil {
 			t.Errorf("%v: no error", bad)
 		}
@@ -344,7 +346,7 @@ func newWRig(t *testing.T, customers map[string]map[string]string, extra map[str
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { os.RemoveAll(control) })
-	vars := map[string]string{"RUNTIME": "workerd", "WORKERD_BIN": bin, "CUSTOMERS_DIR": dir, "CONTROL_DIR": control, "FN_BUDGET_MIB": "4000", "FN_MIN_RESIDENCY_MS": "0",
+	vars := map[string]string{"WORKERD_BIN": bin, "CUSTOMERS_DIR": dir, "CONTROL_DIR": control, "FN_BUDGET_MIB": "4000", "FN_MIN_RESIDENCY_MS": "0",
 		"REQUEST_MS": "8000", "START_MS": "20000", "WD_LOOK_MS": "200", "WD_MEMORY_LOOK_MS": "50", "WD_RUNAWAY_LOOKS": "5", "WD_MEMORY_MIB": "256", "FUNCTIONS_DIR": dir}
 	for k, v := range extra {
 		vars[k] = v
@@ -453,15 +455,42 @@ func TestWorkerdAnswersForTheFunctionsThatFailAndTheOnesThatAreNotThere(t *testi
 }
 
 func TestWorkerdABundleThatDoesNotParseIsLeftOutAndTheCustomersOtherFunctionsRun(t *testing.T) {
-	if _, err := exec.LookPath("node"); err != nil {
-		t.Skip("node is not installed: the bundles are not checked")
-	}
-	r := newWRig(t, map[string]map[string]string{"acme": {"hello": wHello, "syntax": `export default (`}}, nil, func(c *Config) { c.Node = "node" })
+	r := newWRig(t, map[string]map[string]string{"acme": {"hello": wHello, "syntax": `export default (`}}, nil, nil)
 	if a := r.do("/acme/hello"); a.status != 200 {
 		t.Fatalf("the good function of a customer with a bad one: %d %q", a.status, a.body)
 	}
 	if a := r.do("/acme/syntax"); a.status != 502 {
 		t.Errorf("the bundle that does not parse: %d, want 502", a.status)
+	}
+}
+
+func TestWorkerdTheBundlesAreCheckedByOneThrowawayProcessAndNotAgainWhileTheyStayTheSame(t *testing.T) {
+	r := newWRig(t, map[string]map[string]string{"acme": {"a": wHello, "b": wHello}}, nil, nil)
+	if a := r.do("/acme/a"); a.status != 200 {
+		t.Fatalf("a: %d %q", a.status, a.body)
+	}
+	if n := r.s.wl.probes; n != 1 {
+		t.Fatalf("the probes of two good bundles: %d, want 1 (one throwaway process for both)", n)
+	}
+	_ = r.s.wpool.ReapIdle(0, nil)
+	eventually(t, "the process is gone", func() bool { return len(r.running()) == 0 })
+	if a := r.do("/acme/b"); a.status != 200 {
+		t.Fatalf("b after the restart: %d %q", a.status, a.body)
+	}
+	if n := r.s.wl.probes; n != 1 {
+		t.Errorf("the probes after a restart with the same bundles: %d, want still 1", n)
+	}
+	// A bundle that is changed is checked again, and a bad one is found among the good.
+	if err := os.WriteFile(filepath.Join(r.dir, "acme", "b", "index.mjs"), []byte("export default ("), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_ = r.s.wpool.ReapIdle(0, nil)
+	eventually(t, "the process is gone again", func() bool { return len(r.running()) == 0 })
+	if a := r.do("/acme/a"); a.status != 200 {
+		t.Errorf("a with a bad neighbour: %d %q", a.status, a.body)
+	}
+	if a := r.do("/acme/b"); a.status != 502 {
+		t.Errorf("the bundle that was changed into a bad one: %d, want 502", a.status)
 	}
 }
 

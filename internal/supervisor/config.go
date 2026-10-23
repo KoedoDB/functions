@@ -1,9 +1,10 @@
-// Package supervisor is the KoedoDB function supervisor: it routes /<name>/... to the function in <FUNCTIONS_DIR>/<name>/index.mjs, which runs in a process of its own (Node, started on the
-// function's first request, stopped when idle or to make room: internal/residents), and answers for it.
+// Package supervisor is the KoedoDB function supervisor: it routes /<customer>/<name>/... (or /<name>/... for one customer) to a function that runs in the customer's workerd process
+// (unmodified workerd: one process for each customer, all of the customer's functions in it, started on the first request, stopped when idle or to make room: internal/residents), and
+// answers for it.
 //
-// It is trusted platform code; the functions are not. A function process gets a clean environment, permission (Node's --permission) to read its own directory and the runner and to use
-// /tmp and its own scratch directory, no child process, no worker, no native addon; and a heap limit. The supervisor is written in Go so that it takes about 10 MiB of the Pod's memory,
-// not the 50 MiB a Node supervisor takes.
+// It is trusted platform code; the functions are not. A customer's process gets a clean environment (the variables the functions may read are in its configuration and nowhere else), no
+// core files, and limits applied from outside: memory and CPU looks, and a cgroup when there is one (workerd.go, limits.go, docs/workerd.md). The supervisor is written in Go so that it takes
+// about 10 MiB of the Pod's memory.
 package supervisor
 
 import (
@@ -18,14 +19,11 @@ import (
 type Config struct {
 	Functions string // where the bundles are: <Functions>/<name>/index.mjs
 	Control   string // where the sockets and scratch directories of the processes are (a tmpfs of its own, not /tmp); the sockets paths must be short (107 bytes at most)
-	Runner    string // runner.mjs
-	Node      string // the node executable
 	Listen    string // address, ":9000"
 
 	IdleTimeout    time.Duration // a process with no request for this long is stopped
 	RequestTimeout time.Duration // a request that takes longer is cancelled (504) and its process is killed
 	StartTimeout   time.Duration // how long to wait for a process to listen
-	HeapMB         int           // V8 old-space limit of each process; 0: leave it to Node
 	MaxConcurrent  int           // requests being served by one function at once; over it: 429
 	EnvAllow       []string      // the variables a function may read (the Project's secrets); nothing else is passed on
 
@@ -37,8 +35,7 @@ type Config struct {
 
 	Getenv func(string) string // where the allowed variables come from (os.Getenv)
 
-	// The workerd runtime (RUNTIME=workerd, workerd.go): one workerd process for each customer, all of the customer's functions in it. The limits are applied from outside.
-	Runtime      string        // "node" (a Node process for each function) or "workerd" (one workerd process for each customer)
+	// The workerd processes (workerd.go): one for each customer, all of the customer's functions in it. The limits are applied from outside.
 	CustomersDir string        // when set: <CustomersDir>/<customer>/<function>/index.mjs, routes /<customer>/<function>/...; empty: one customer, "default", with the functions of Functions
 	Workerd      string        // the workerd executable
 	CompatDate   string        // the compatibility date of every function (the platform's, never the customer's)
@@ -81,21 +78,17 @@ func ConfigFromEnv(lookup func(string) (string, bool), cgroupMemoryMiB func() (f
 	c := Config{
 		Functions:      str("FUNCTIONS_DIR", "/f"),
 		Control:        str("CONTROL_DIR", "/sockets"),
-		Runner:         str("RUNNER", "/sup/runner.mjs"),
-		Node:           str("NODE_BIN", "node"),
 		Listen:         str("LISTEN", ":9000"),
 		IdleTimeout:    ms("IDLE_MS", 30000),
 		RequestTimeout: ms("REQUEST_MS", 10000),
 		StartTimeout:   ms("START_MS", 30000),
-		HeapMB:         int(num("HEAP_MB", 144)), // 3/8 of a Pod of 384 MiB
 		MaxConcurrent:  int(num("MAX_CONCURRENT", 20)),
-		EstimateMiB:    num("FN_ESTIMATE_MIB", 105), // the workerd runtime sets 50 below when it is not given
+		EstimateMiB:    num("FN_ESTIMATE_MIB", 50), // an idle workerd is about 50 MiB resident (doc/WORKERD-LIMITS.md of the KoedoDB repository)
 		MinResidency:   ms("FN_MIN_RESIDENCY_MS", 1000),
 		Wait:           ms("FN_WAIT_MS", 5000),
 		MaxWaiters:     int(num("FN_MAX_WAITERS", 20)),
 		Getenv:         os.Getenv,
 
-		Runtime:      str("RUNTIME", "node"),
 		CustomersDir: str("CUSTOMERS_DIR", ""),
 		Workerd:      str("WORKERD_BIN", "/sup/workerd"),
 		CompatDate:   str("WD_COMPAT_DATE", "2026-10-01"),
@@ -114,7 +107,7 @@ func ConfigFromEnv(lookup func(string) (string, bool), cgroupMemoryMiB func() (f
 			c.EnvAllow = append(c.EnvAllow, name)
 		}
 	}
-	// The budget: set by FN_BUDGET_MIB, else the Pod's memory limit (cgroup) less what the supervisor needs, else a default for a Pod of 384 MiB.
+	// The budget: set by FN_BUDGET_MIB, else the Pod's memory limit (cgroup) less what the supervisor needs, else a default for a Pod of 384 MiB (the processes of 6 customers).
 	reserve := num("SUPERVISOR_RESERVE_MIB", 30)
 	switch {
 	case str("FN_BUDGET_MIB", "") != "":
@@ -126,20 +119,15 @@ func ConfigFromEnv(lookup func(string) (string, bool), cgroupMemoryMiB func() (f
 			c.BudgetMiB = 330
 		}
 	}
-	switch c.Runtime {
-	case "node":
-	case "workerd":
-		if v, ok := lookup("FN_ESTIMATE_MIB"); !ok || v == "" {
-			c.EstimateMiB = 50 // an idle workerd is about 50 MiB resident (doc/WORKERD-LIMITS.md of the KoedoDB repository)
-		}
-		if c.MemoryMiB <= 0 || c.CPUQuotaPct <= 0 || c.Look <= 0 || c.MemoryLook <= 0 || c.RunawayLooks <= 0 || c.PidsLimit <= 0 {
-			errs = append(errs, "WD_MEMORY_MIB, WD_CPU_QUOTA_PCT, WD_LOOK_MS, WD_MEMORY_LOOK_MS, WD_RUNAWAY_LOOKS and WD_PIDS must be more than 0")
-		}
-		if c.UIDBase < 0 || (c.UIDBase > 0 && c.UIDCount <= 0) {
-			errs = append(errs, "WD_UID_BASE must be 0 or more and WD_UID_COUNT more than 0")
-		}
-	default:
-		errs = append(errs, fmt.Sprintf("RUNTIME=%q is not node or workerd", c.Runtime))
+	// RUNTIME is not a setting any more: workerd is the only runtime. An old Pod's other value is refused rather than ignored.
+	if v := str("RUNTIME", ""); v != "" && v != "workerd" {
+		errs = append(errs, fmt.Sprintf("RUNTIME=%q: workerd is the only runtime (leave RUNTIME out)", v))
+	}
+	if c.MemoryMiB <= 0 || c.CPUQuotaPct <= 0 || c.Look <= 0 || c.MemoryLook <= 0 || c.RunawayLooks <= 0 || c.PidsLimit <= 0 {
+		errs = append(errs, "WD_MEMORY_MIB, WD_CPU_QUOTA_PCT, WD_LOOK_MS, WD_MEMORY_LOOK_MS, WD_RUNAWAY_LOOKS and WD_PIDS must be more than 0")
+	}
+	if c.UIDBase < 0 || (c.UIDBase > 0 && c.UIDCount <= 0) {
+		errs = append(errs, "WD_UID_BASE must be 0 or more and WD_UID_COUNT more than 0")
 	}
 	if c.BudgetMiB <= 0 {
 		errs = append(errs, "the budget must be more than 0")

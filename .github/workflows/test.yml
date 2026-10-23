@@ -23,7 +23,17 @@ jobs:
       - name: Install workerd (the version of workerd/package-lock.json; npm checks its integrity)
         run: npm ci --ignore-scripts --no-audit --no-fund
         working-directory: workerd
-      - name: Run the supervisor (both runtimes) and the LRU of resident functions
+      - name: Run the supervisor (with the real workerd) and the LRU of resident customers
         run: go test -race ./...
         env:
           WORKERD_BIN: ${{ github.workspace }}/workerd/node_modules/@cloudflare/workerd-linux-64/bin/workerd
+
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the image
+        run: docker build -t koedodb-functions .
+      - name: Run it as the Pod does (non-root, read-only root, no capabilities) and try a loop and a memory bomb
+        run: scripts/image-test.sh koedodb-functions
