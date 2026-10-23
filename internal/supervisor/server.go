@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httputil"
@@ -25,9 +26,12 @@ var nameRE = regexp.MustCompile(`^[a-z0-9-]{1,40}$`)
 // Server is the supervisor.
 type Server struct {
 	cfg  Config
-	pool *residents.Pool[*Proc]
+	pool *residents.Pool[*Proc] // the Node runtime: a process for each function (nil with RUNTIME=workerd)
 	l    *launcher
 	log  *slog.Logger
+
+	wpool *residents.Pool[*WProc] // the workerd runtime: a process for each customer (nil with RUNTIME=node)
+	wl    *wlauncher
 
 	mu       sync.Mutex
 	inflight map[string]*atomic.Int32 // requests being served by one function, for MAX_CONCURRENT
@@ -47,8 +51,23 @@ func New(cfg Config, logger *slog.Logger) (*Server, error) {
 		return nil, err
 	}
 	s := &Server{cfg: cfg, log: logger, inflight: map[string]*atomic.Int32{}}
-	s.l = &launcher{cfg: cfg, logf: func(f string, a ...any) { logger.Info(strings.TrimSpace(f), "args", a) }}
 	opts := residents.Options{BudgetMiB: cfg.BudgetMiB, EstimateMiB: cfg.EstimateMiB, MinResidency: cfg.MinResidency, Wait: cfg.Wait, MaxWaiters: cfg.MaxWaiters}
+	if cfg.Runtime == "workerd" {
+		if st, err := os.Stat(cfg.Workerd); err != nil || st.Mode()&0o111 == 0 {
+			return nil, fmt.Errorf("WORKERD_BIN=%q is not an executable file", cfg.Workerd)
+		}
+		s.wl = &wlauncher{cfg: cfg, log: logger}
+		if cfg.UIDBase > 0 {
+			if os.Geteuid() != 0 {
+				return nil, errors.New("WD_UID_BASE needs the supervisor to run as root: a process cannot switch to another user otherwise")
+			}
+			s.wl.uids = newUIDAlloc(cfg.UIDBase, cfg.UIDCount)
+		}
+		s.wpool = residents.New(residents.Hooks[*WProc]{Start: s.wl.start, Stop: s.wl.stop, RSS: s.wl.rss}, opts)
+		s.wl.pool = s.wpool
+		return s, nil
+	}
+	s.l = &launcher{cfg: cfg, logf: func(f string, a ...any) { logger.Info(strings.TrimSpace(f), "args", a) }}
 	s.pool = residents.New(residents.Hooks[*Proc]{Start: s.l.start, Stop: s.l.stop, RSS: s.l.rss}, opts)
 	s.l.pool = s.pool
 	return s, nil
@@ -69,9 +88,13 @@ func (s *Server) counter(name string) *atomic.Int32 {
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	t0 := time.Now()
 	if r.URL.Path == "/_stats" {
-		st := s.pool.Stats()
+		st := s.stats()
 		w.Header().Set("content-type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"running": st.Resident, "starts": st.Starts, "evictions": st.Evictions, "busy": st.Busy, "waits": st.Waits, "used_mib": st.UsedMiB, "budget_mib": st.BudgetMiB})
+		return
+	}
+	if s.wl != nil {
+		s.serveWorkerd(w, r, t0)
 		return
 	}
 	parts := strings.SplitN(strings.TrimPrefix(r.URL.Path, "/"), "/", 2)
@@ -172,7 +195,11 @@ func (s *Server) Run(ctx context.Context) error {
 			case <-ctx.Done():
 				return
 			case <-tick.C:
-				if stopped := s.pool.ReapIdle(s.cfg.IdleTimeout, nil); len(stopped) > 0 {
+				if s.wpool != nil {
+					if stopped := s.wpool.ReapIdle(s.cfg.IdleTimeout, nil); len(stopped) > 0 {
+						s.log.Info("idle customers stopped", "customers", stopped)
+					}
+				} else if stopped := s.pool.ReapIdle(s.cfg.IdleTimeout, nil); len(stopped) > 0 {
 					s.log.Info("idle functions stopped", "functions", stopped)
 				}
 			}
@@ -188,7 +215,7 @@ func (s *Server) Run(ctx context.Context) error {
 	sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(sctx)
-	s.pool.StopAll()
+	s.Stop()
 	return nil
 }
 
@@ -196,4 +223,19 @@ func (s *Server) Run(ctx context.Context) error {
 func (s *Server) Handler() http.Handler { return s }
 
 // Stop stops every function process.
-func (s *Server) Stop() { s.pool.StopAll() }
+func (s *Server) Stop() {
+	if s.wpool != nil {
+		s.wpool.StopAll()
+	}
+	if s.pool != nil {
+		s.pool.StopAll()
+	}
+}
+
+// stats is the statistics of the pool the runtime uses.
+func (s *Server) stats() residents.Stats {
+	if s.wpool != nil {
+		return s.wpool.Stats()
+	}
+	return s.pool.Stats()
+}

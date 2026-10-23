@@ -41,6 +41,12 @@ The answers the supervisor gives itself:
 
 The supervisor itself takes about 10 MiB.
 
+## The workerd runtime
+
+`RUNTIME=workerd` runs a customer's functions on the unmodified [workerd](https://github.com/cloudflare/workerd): one process for each customer, all of the customer's functions in it, with the limits applied from
+outside (a cgroup when the supervisor has a writable one, and always the supervisor's own looks at memory and CPU). Same bundles, same answers. **`docs/workerd.md`** says how it works, which limit comes from where,
+what it can and cannot do inside a hardened Pod, and what is not done. The settings are the `WD_*` and `WORKERD_BIN`, `CUSTOMERS_DIR`, `RUNTIME` rows below.
+
 ## Settings
 
 All by environment variables; a value that is not a number is an error at start.
@@ -64,6 +70,18 @@ All by environment variables; a value that is not a number is an error at start.
 | `FN_MIN_RESIDENCY_MS` | 1000 | a process is not stopped to make room before this |
 | `FN_WAIT_MS` | 5000 | how long a request waits for room |
 | `FN_MAX_WAITERS` | 20 | how many may wait |
+| `RUNTIME` | `node` | `node` (a Node process for each function) or `workerd` (a workerd process for each customer) |
+| `WORKERD_BIN` | `/sup/workerd` | the workerd executable (the image has the official release) |
+| `CUSTOMERS_DIR` | | workerd: `<dir>/<customer>/<function>/index.mjs`, routes `/<customer>/<function>/...`; empty: one customer, `default`, with `FUNCTIONS_DIR` |
+| `WD_COMPAT_DATE` | `2026-10-01` | workerd: the compatibility date of every function |
+| `WD_MEMORY_MIB` | 256 | workerd: a process above this resident memory is killed (and `memory.max` of its cgroup) |
+| `WD_CPU_QUOTA_PCT` | 100 | workerd: the CPU a process may use, % of one core (`cpu.max`; and what "nearly all" means to the runaway rule) |
+| `WD_LOOK_MS` | 2000 | workerd: one look at the CPU |
+| `WD_RUNAWAY_LOOKS` | 5 | workerd: looks in a row at 85% of the quota or more before the process is killed (5 x 2 s = about 10 s) |
+| `WD_MEMORY_LOOK_MS` | 250 | workerd: how often the resident memory is read |
+| `WD_PIDS` | 64 | workerd: `pids.max` of the cgroup |
+| `WD_CGROUP_ROOT` | | workerd: a writable cgroup v2 directory; each customer's process gets a cgroup in it |
+| `WD_UID_BASE`, `WD_UID_COUNT` | 0, 4096 | workerd: customer n runs as `WD_UID_BASE + n` (the supervisor must be root); 0: no switch |
 
 ## The image
 
@@ -80,7 +98,7 @@ To update Node, change the tag and the digest together, and read its [release no
 - **The network is not restricted by Node.** A function can reach `127.0.0.1`, the node, other Pods. NetworkPolicy has to keep it away from other projects, the node and the metadata address.
 - **Memory outside of the V8 heap** (`Buffer`, `ArrayBuffer`) is not capped by `HEAP_MB`; the container's limit and the budget are what stop it.
 - WebSocket and server-sent events are not supported (the supervisor proxies whole HTTP exchanges); not tested.
-- **The wall is the Pod** (a VM under Kata Containers): one Pod holds one project, and only secrets that project's functions may read.
+- **The wall is the Pod** (a microVM): one Pod holds one project, and only secrets that project's functions may read.
 
 ## Tests
 
@@ -88,8 +106,8 @@ To update Node, change the tag and the digest together, and read its [release no
 go vet ./... && go test -race ./...
 ```
 
-They need Node (24) on the machine; a test is skipped without it. They check, among others: routing (path, query, method, headers, body), the life cycle (nothing runs before the first request, idle stop, restart), a clean environment, the permission model, the limits (endless loop → 504 and the others do not feel it, 429, 503 with `Retry-After`), a function over its heap limit dies and the next request is served by a new process, no core file is written, and the LRU (budget, order, in-flight processes are never stopped, waiting and the queue limit).
+They need Node (24) on the machine; a test is skipped without it. With `WORKERD_BIN` (or `workerd` on the PATH) the tests of the workerd runtime run too (the official binary: `cd workerd && npm ci --ignore-scripts`); they are skipped without it. They check, among others: routing (path, query, method, headers, body), the life cycle (nothing runs before the first request, idle stop, restart), a clean environment, the permission model, the limits (endless loop → 504 and the others do not feel it, 429, 503 with `Retry-After`), a function over its heap limit dies and the next request is served by a new process, no core file is written, and the LRU (budget, order, in-flight processes are never stopped, waiting and the queue limit).
 
 ## License
 
-Copyright (c) 2026 RadarWorks LLC. The files in this repository (the supervisor, the runner, the tests and this documentation) are licensed under the [MIT License](LICENSE). Node.js is MIT-licensed too; the image holds the unmodified official `node` image.
+Copyright (c) 2026 RadarWorks LLC. The files in this repository (the supervisor, the runner, the tests and this documentation) are licensed under the [MIT License](LICENSE). Node.js is MIT-licensed too; the image holds the unmodified official `node` image. The image also holds the unmodified official `workerd` binary (Apache-2.0, from the npm package, at the version and integrity hashes of `workerd/package-lock.json`).

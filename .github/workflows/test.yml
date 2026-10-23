@@ -20,5 +20,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
-      - name: Run the supervisor and the LRU of resident functions
+      - name: Install workerd (the version of workerd/package-lock.json; npm checks its integrity)
+        run: npm ci --ignore-scripts --no-audit --no-fund
+        working-directory: workerd
+      - name: Run the supervisor (both runtimes) and the LRU of resident functions
         run: go test -race ./...
+        env:
+          WORKERD_BIN: ${{ github.workspace }}/workerd/node_modules/@cloudflare/workerd-linux-64/bin/workerd
