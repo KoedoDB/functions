@@ -168,5 +168,5 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	st := s.pool.Stats()
-	writeJSON(w, http.StatusOK, map[string]any{"running": st.Resident, "starts": st.Starts, "evictions": st.Evictions, "busy": st.Busy, "waits": st.Waits, "used_mib": st.UsedMiB, "budget_mib": st.BudgetMiB})
+	writeJSON(w, http.StatusOK, map[string]any{"running": st.Resident, "starts": st.Starts, "evictions": st.Evictions, "busy": st.Busy, "waits": st.Waits, "used_mib": st.UsedMiB, "budget_mib": st.BudgetMiB, "seccomp_traps": s.wl.traps.Load()})
 }

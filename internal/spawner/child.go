@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -18,6 +19,8 @@ const prSetNoNewPrivs = 38
 
 // ChildMain is "child [--nproc N] <workerd> <config>": it does not return when it works (workerd takes its place).
 func ChildMain(args []string) error {
+	// no_new_privs and the seccomp filter belong to a thread, and execve keeps those of the thread that calls it: stay on this one until workerd takes the process over.
+	runtime.LockOSThread()
 	nproc := 0
 	for len(args) >= 2 && args[0] == "--nproc" {
 		n, err := strconv.Atoi(args[1])
@@ -42,6 +45,10 @@ func ChildMain(args []string) error {
 	// No way back: a setuid or file-capability binary cannot give this process more than it has, whatever it executes.
 	if _, _, e := syscall.RawSyscall6(syscall.SYS_PRCTL, prSetNoNewPrivs, 1, 0, 0, 0, 0); e != 0 {
 		return fmt.Errorf("no_new_privs: %v", e)
+	}
+	// The tripwire (seccomp.go): from here on, a system call that only a way out of the wall needs ends the process with SIGSYS, and the spawner says so.
+	if err := installTrap(); err != nil {
+		return err
 	}
 	lim := func(res int, v uint64) error {
 		return syscall.Setrlimit(res, &syscall.Rlimit{Cur: v, Max: v})

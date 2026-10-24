@@ -41,6 +41,8 @@ import (
 func TestMain(m *testing.M) {
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
+		case "seccomp-helper":
+			os.Exit(seccompHelper(os.Args[2:]))
 		case "child":
 			if err := ChildMain(os.Args[2:]); err != nil {
 				fmt.Fprintln(os.Stderr, "child:", err)

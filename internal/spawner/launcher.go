@@ -67,6 +67,7 @@ type launcher struct {
 	mu     sync.Mutex
 	starts int
 	seq    int
+	traps  atomic.Int64 // processes the kernel ended for a system call of the seccomp tripwire
 	live   map[string]int // processes of a customer that are running (real ones and probes): when it reaches 0 the user has nothing left
 }
 
@@ -286,6 +287,11 @@ func (l *launcher) start(key string) (*WProc, error) {
 		err := b.cmd.Wait()
 		close(p.exited)
 		reason, _ := p.reason.Load().(string)
+		if trapped(err) && reason == "" {
+			// Not our own kill: the kernel ended it for a system call of the tripwire (seccomp.go). Normal code never calls these: someone is testing the wall.
+			l.log.Error("seccomp tripwire: a customer's process called a system call that only a way out of the wall needs", "customer", id, "generation", gen, "uid", c.uid, "event", "seccomp_trap")
+			l.traps.Add(1)
+		}
 		l.log.Info("a customer's process exited", "customer", id, "generation", gen, "error", err, "killed_for", reason)
 		b.cleanup()
 		l.pool.Exited(key, p)
@@ -552,4 +558,14 @@ func (w *lineWriter) line(s string) {
 		s = s[:2048]
 	}
 	w.log.Info("function output", "customer", w.customer, "line", s)
+}
+
+// trapped says whether the process ended with SIGSYS, which is what the seccomp tripwire (seccomp.go) does; nothing else of ours sends it.
+func trapped(err error) bool {
+	var ee *exec.ExitError
+	if !errors.As(err, &ee) {
+		return false
+	}
+	ws, ok := ee.Sys().(syscall.WaitStatus)
+	return ok && ws.Signaled() && ws.Signal() == syscall.SIGSYS
 }
