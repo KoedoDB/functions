@@ -2,6 +2,7 @@ package spawner
 
 import (
 	"fmt"
+	"github.com/koedodb/functions/internal/wdconfig"
 	"sort"
 	"sync"
 )
@@ -16,13 +17,14 @@ type Limits struct {
 // customer is one definition of a customer: the functions' bundles, the secrets and the limits. It is immutable once it is in the table: a put makes a new one with the next
 // generation, and the processes of the old one drain and stop (they are named <customer>.<generation>).
 type customer struct {
-	id      string
-	gen     uint64
-	uid     int
-	fns     map[string][]byte
-	secrets map[string]string
-	limits  Limits
-	bytes   int64
+	id       string
+	gen      uint64
+	uid      int
+	fns      map[string][]byte
+	secrets  map[string]string
+	limits   Limits
+	fnLimits map[string]wdconfig.FnLimits // for every function, all fields set (Validate fills the defaults in)
+	bytes    int64
 }
 
 // names are the functions' names, sorted.

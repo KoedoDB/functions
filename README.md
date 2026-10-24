@@ -1,6 +1,6 @@
 # KoedoDB function runtime
 
-KoedoDB runs a project's functions (Supabase-style: one HTTP handler per function) on the unmodified [workerd](https://github.com/cloudflare/workerd), one process for each customer, **with several customers in one microVM**, under a small supervisor of our own written in Go. This repository holds the supervisor, the image, and the tests.
+KoedoDB runs a project's functions (Supabase-style: one HTTP handler per function) on [workerd](https://github.com/cloudflare/workerd) with a small patch that limits each function, one process for each customer, **with several customers in one microVM**, under a small supervisor of our own written in Go. This repository holds the supervisor, the image, and the tests.
 
 This is not an official workerd, Cloudflare or Supabase repository, and KoedoDB is not affiliated with any of them.
 
@@ -31,7 +31,7 @@ A put replaces the customer's whole definition and is checked first (a throwaway
 
 ### Limits
 
-workerd has no CPU time limit and no memory limit of its own, so they come from outside the process: the spawner looks at each process (`WD_MEMORY_LOOK_MS`: resident memory above `WD_MEMORY_MIB`, 256, is killed; `WD_RUNAWAY_LOOKS` looks of `WD_LOOK_MS` at 85 % of the CPU quota, about 10 s, is killed: SIGKILL, because a looping workerd ignores SIGTERM), `RLIMIT_NPROC` (per user, so the customer's own), no core files, and, with a delegated cgroup (`WD_CGROUP_ROOT`), the kernel enforces `memory.max`, `cpu.max` and `pids.max` too. `docs/workerd.md` says which limit comes from where.
+Each function's own limits (heap, CPU time, wall time, ArrayBuffer memory, subrequests) are enforced inside workerd by the patch (`docs/limits.md`: only that function is stopped, a loop in milliseconds). The limits of the customer's whole process come from outside, as the outer wall and a backup: the spawner looks at each process (`WD_MEMORY_LOOK_MS`: resident memory above `WD_MEMORY_MIB`, 1024, is killed; `WD_RUNAWAY_LOOKS` looks of `WD_LOOK_MS` at 85 % of the CPU quota, about 10 s, is killed: SIGKILL, because a looping workerd ignores SIGTERM), `RLIMIT_NPROC` (per user, so the customer's own), no core files, and, with a delegated cgroup (`WD_CGROUP_ROOT`), the kernel enforces `memory.max`, `cpu.max` and `pids.max` too. `docs/workerd.md` says which limit comes from where.
 
 ### Memory: the LRU of resident processes
 
@@ -50,15 +50,16 @@ All by environment variables, in [docs/shared-vm.md](docs/shared-vm.md#settings)
 ## The image
 
 ```
+workerd/build.sh                       # once for each upstream workerd release, on a build host (about an hour): writes workerd/workerd-linux-amd64 and workerd/workerd.sha256
 docker build -t koedodb-functions .
 scripts/image-test.sh koedodb-functions
 ```
 
-The image is Debian's slim base (pinned by digest), `ca-certificates` (workerd aborts at start without the system's certificates), the supervisor, and the official `workerd` binary: about 220 MiB, no Node, no npm. The binary comes from the npm package at the version and integrity hashes of `workerd/package-lock.json`, in a builder stage that is not in the image; `docker build` runs `workerd --version` so that it stops when the binary does not run on the base's glibc.
+Every base image is Debian 13 ("trixie"), pinned by digest: `golang:…-trixie` for the supervisor's build, `debian:trixie-slim` for the image. The image is that base, `ca-certificates` (workerd aborts at start without the system's certificates), the supervisor, and `workerd` **with the KoedoDB patch** (per-function limits, [docs/limits.md](docs/limits.md)): about 220 MiB, no Node, no npm. The binary is built from the upstream release named in `workerd/UPSTREAM` plus `workerd/patches/` by `workerd/build.sh` (Bazel, every download pinned by SHA-256, the LLVM release checked with its signature) and is not in git (150 MB); `docker build` checks it against `workerd/workerd.sha256` and runs `workerd --version`, so it stops when the file is not the one that was built and tested, or does not run on the base's glibc.
 
 `scripts/image-test.sh` runs the image as the Pod does: two containers (the spawner as root with exactly four capabilities, `no-new-privileges` and a read-only root file system; the router as user 10001 with none), sharing a network and a tmpfs, with mutual TLS on the control API. It puts two customers, checks the wall between them (as one customer's user: the sockets directory, the state directory, the neighbour's environment and process), a loop, a memory bomb, and a delete.
 
-To update workerd, change `workerd/package.json`, run `npm install --package-lock-only --ignore-scripts` there, and read the [release notes](https://github.com/cloudflare/workerd/releases) and [security advisories](https://github.com/cloudflare/workerd/security/advisories) first.
+To update workerd: read the [release notes](https://github.com/cloudflare/workerd/releases) and [security advisories](https://github.com/cloudflare/workerd/security/advisories), rebase the patches onto the new release (see `workerd/UPSTREAM`), run `workerd/build.sh`, then run the limits tests (`scripts/test-in-docker.sh`, or `WORKERD_BIN=… go test ./internal/spawner` as root) before an image is built.
 
 ## Tests
 
@@ -71,4 +72,4 @@ scripts/test-in-docker.sh                    # all of them, as the Pod runs the 
 
 ## License
 
-Copyright (c) 2026 RadarWorks LLC. The files in this repository (the supervisor, the tests and this documentation) are licensed under the [MIT License](LICENSE). The image holds the unmodified official `workerd` binary (Apache-2.0, from the npm package, at the version and integrity hashes of `workerd/package-lock.json`) and Debian's slim base image with its `ca-certificates` package.
+Copyright (c) 2026 RadarWorks LLC. The files in this repository (the supervisor, the tests and this documentation) are licensed under the [MIT License](LICENSE). The image holds a `workerd` binary built from the official source (Apache-2.0) with the patches in `workerd/patches/` (the same license) and Debian's slim base image with its `ca-certificates` package.

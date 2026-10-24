@@ -27,7 +27,7 @@ func TestCapnpStringEscapesWhatBreaksALiteral(t *testing.T) {
 func TestTheConfigHasARouterAWorkerForEachFunctionAndTheSecretsAsEnvironmentBindings(t *testing.T) {
 	cfg, err := Build(Spec{
 		Base: "/state/run/acme.1", CompatDate: "2026-10-01",
-		Functions: []Function{{"zeta", "/state/run/acme.1/zeta/index.mjs"}, {"alpha", "/state/run/acme.1/alpha/index.mjs"}},
+		Functions: []Function{{Name: "zeta", Bundle: "/state/run/acme.1/zeta/index.mjs"}, {Name: "alpha", Bundle: "/state/run/acme.1/alpha/index.mjs"}},
 		Secrets:   []string{"B_KEY", "A_KEY"},
 	})
 	if err != nil {
@@ -56,20 +56,20 @@ func TestTheConfigHasARouterAWorkerForEachFunctionAndTheSecretsAsEnvironmentBind
 		t.Error("the socket address must be the placeholder")
 	}
 	again, _ := Build(Spec{Base: "/state/run/acme.1", CompatDate: "2026-10-01",
-		Functions: []Function{{"alpha", "/state/run/acme.1/alpha/index.mjs"}, {"zeta", "/state/run/acme.1/zeta/index.mjs"}}, Secrets: []string{"A_KEY", "B_KEY"}})
+		Functions: []Function{{Name: "alpha", Bundle: "/state/run/acme.1/alpha/index.mjs"}, {Name: "zeta", Bundle: "/state/run/acme.1/zeta/index.mjs"}}, Secrets: []string{"A_KEY", "B_KEY"}})
 	if again != cfg {
 		t.Error("the same input gives another configuration")
 	}
 }
 
 func TestTheConfigRefusesWhatItCannotMakeSafely(t *testing.T) {
-	ok := Spec{Base: "/s/x", CompatDate: "2026-10-01", Functions: []Function{{"a", "/s/x/a/index.mjs"}}}
+	ok := Spec{Base: "/s/x", CompatDate: "2026-10-01", Functions: []Function{{Name: "a", Bundle: "/s/x/a/index.mjs"}}}
 	bad := map[string]func(*Spec){
 		"no function":             func(s *Spec) { s.Functions = nil },
 		"no date":                 func(s *Spec) { s.CompatDate = "" },
 		"a relative base":         func(s *Spec) { s.Base = "s/x" },
-		"a bad name":              func(s *Spec) { s.Functions = []Function{{"A_b", "/s/x/x/index.mjs"}} },
-		"a relative bundle":       func(s *Spec) { s.Functions = []Function{{"a", "f/a/index.mjs"}} },
+		"a bad name":              func(s *Spec) { s.Functions = []Function{{Name: "A_b", Bundle: "/s/x/x/index.mjs"}} },
+		"a relative bundle":       func(s *Spec) { s.Functions = []Function{{Name: "a", Bundle: "f/a/index.mjs"}} },
 		"a bad variable":          func(s *Spec) { s.Secrets = []string{"A B"} },
 		"a variable that is code": func(s *Spec) { s.Secrets = []string{`X", text = "y"), (name = "Z`} },
 		"a variable twice":        func(s *Spec) { s.Secrets = []string{"A", "A"} },
@@ -92,6 +92,44 @@ func TestNamesAreSmallLettersDigitsAndDashesOnly(t *testing.T) {
 	for _, bad := range []string{"", "A", "a_b", "a.b", "a/b", "..", "a b", strings.Repeat("a", 41), "a\n", "%61"} {
 		if NameRE.MatchString(bad) {
 			t.Errorf("%q should not be a name", bad)
+		}
+	}
+}
+
+func TestAFunctionsLimitsAreWrittenOnItsOwnWorkerOnly(t *testing.T) {
+	cfg, err := Build(Spec{Base: "/s/x", CompatDate: "2026-10-01", Functions: []Function{
+		{Name: "a", Bundle: "/s/x/a/index.mjs", Limits: FnLimits{HeapMB: 256, CPUMs: 1000, WallMs: 8000, ExternalMB: 128, Subrequests: 50, ConcurrentSubrequests: 32}},
+		{Name: "b", Bundle: "/s/x/b/index.mjs"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "limits = (cpuMs = 1000, wallMs = 8000, heapMb = 256, externalMb = 128, subrequests = 50, concurrentSubrequests = 32)"
+	if strings.Count(cfg, "limits = ") != 1 || !strings.Contains(cfg, want) {
+		t.Errorf("want exactly one limits, %s:\n%s", want, cfg)
+	}
+	// it belongs to fn-a's worker, not to fn-b's and not to the router
+	a, b := strings.Index(cfg, `name = "fn-a"`), strings.Index(cfg, `name = "fn-b"`)
+	l := strings.Index(cfg, "limits = ")
+	if !(a < l && l < b) {
+		t.Error("the limits are not inside the Worker of fn-a")
+	}
+}
+
+func TestV8FlagsAreWrittenAndOnlyPlainFlagsAreAccepted(t *testing.T) {
+	ok := Spec{Base: "/s/x", CompatDate: "2026-10-01", Functions: []Function{{Name: "a", Bundle: "/s/x/a/index.mjs"}}, V8Flags: DefaultV8Flags}
+	cfg, err := Build(ok)
+	if err != nil || !strings.Contains(cfg, `v8Flags = ["--no-turbofan"],`) {
+		t.Fatalf("%v\n%s", err, cfg)
+	}
+	ok.V8Flags = nil
+	if cfg, _ = Build(ok); strings.Contains(cfg, "v8Flags") {
+		t.Error("no flags, no field")
+	}
+	for _, bad := range []string{`--x"], text = ["`, "no-dash", "--a b", "--" + strings.Repeat("a", 70), `--a\n`} {
+		ok.V8Flags = []string{bad}
+		if _, err := Build(ok); err == nil {
+			t.Errorf("%q accepted", bad)
 		}
 	}
 }

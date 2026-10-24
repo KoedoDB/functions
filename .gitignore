@@ -2,3 +2,4 @@ core
 core.*
 
 node_modules
+workerd/workerd-linux-amd64

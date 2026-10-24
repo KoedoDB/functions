@@ -205,7 +205,8 @@ func (s *Server) Stop() {
 type Definition struct {
 	Functions map[string][]byte
 	Secrets   map[string]string
-	Limits    Limits // zero fields: the platform's maximum
+	Limits    Limits                       // zero fields: the platform's maximum
+	FnLimits  map[string]wdconfig.FnLimits // of each function: zero fields are the default (never "no limit"); Validate fills them in and checks the maximum
 }
 
 // Error is a refusal with the HTTP status it is answered with.
@@ -262,7 +263,37 @@ func (s *Server) Validate(id string, d *Definition) *Error {
 		return refuse(http.StatusBadRequest, "limits: memory_mib 32..%v, cpu_quota_pct 1..%v, pids 8..%d (the platform's maximum)", s.cfg.MemoryMiB, s.cfg.CPUQuotaPct, s.cfg.PidsLimit)
 	}
 	d.Limits = lim
+	fl := make(map[string]wdconfig.FnLimits, len(d.Functions))
+	for name := range d.Functions {
+		l, e := s.fnLimits(name, d.FnLimits[name])
+		if e != nil {
+			return e
+		}
+		fl[name] = l
+	}
+	d.FnLimits = fl
 	return nil
+}
+
+// fnLimits fills the zero fields of a function's limits with the default and refuses a field above the platform's maximum.
+func (s *Server) fnLimits(name string, l wdconfig.FnLimits) (wdconfig.FnLimits, *Error) {
+	d, m := s.cfg.FnDefault, s.cfg.FnMax
+	fill := func(v *uint32, def uint32) {
+		if *v == 0 {
+			*v = def
+		}
+	}
+	fill(&l.HeapMB, d.HeapMB)
+	fill(&l.CPUMs, d.CPUMs)
+	fill(&l.WallMs, d.WallMs)
+	fill(&l.ExternalMB, d.ExternalMB)
+	fill(&l.Subrequests, d.Subrequests)
+	fill(&l.ConcurrentSubrequests, d.ConcurrentSubrequests)
+	if l.HeapMB < 16 || l.HeapMB > m.HeapMB || l.CPUMs > m.CPUMs || l.WallMs > m.WallMs || l.ExternalMB > m.ExternalMB || l.Subrequests > m.Subrequests || l.ConcurrentSubrequests > m.ConcurrentSubrequests {
+		return l, refuse(http.StatusBadRequest, "limits of %q: heap_mb 16..%d, cpu_ms ..%d, wall_ms ..%d, external_mb ..%d, subrequests ..%d, concurrent_subrequests ..%d (the platform's maximum)",
+			name, m.HeapMB, m.CPUMs, m.WallMs, m.ExternalMB, m.Subrequests, m.ConcurrentSubrequests)
+	}
+	return l, nil
 }
 
 // Put makes or replaces a customer (the definition has been validated). The bundles are checked by a throwaway workerd running as the customer's user before anything changes: if one does
@@ -306,7 +337,7 @@ func (s *Server) Put(ctx context.Context, id string, d Definition) (*Info, *Erro
 		}
 	}
 	sort.Strings(changed)
-	next := &customer{id: id, uid: uid, fns: d.Functions, secrets: d.Secrets, limits: d.Limits, bytes: size}
+	next := &customer{id: id, uid: uid, fns: d.Functions, secrets: d.Secrets, limits: d.Limits, fnLimits: d.FnLimits, bytes: size}
 	if len(changed) > 0 {
 		if bad := s.checkBundles(ctx, next, changed); len(bad) > 0 {
 			abandon()

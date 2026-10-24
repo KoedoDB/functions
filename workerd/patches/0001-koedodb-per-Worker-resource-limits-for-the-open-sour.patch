@@ -1,0 +1,888 @@
+From 9496fd77acb7206fc750ac7da1bad69aea5bd209 Mon Sep 17 00:00:00 2001
+From: banil246 <igoigo246@gmail.com>
+Date: Sun, 18 Oct 2026 05:28:30 +0900
+Subject: [PATCH 1/3] koedodb: per-Worker resource limits for the open-source
+ server
+
+The open-source workerd server uses NullIsolateLimitEnforcer / NullLimitEnforcer ('Single-tenant policy:
+no limits'), so one Worker can stop all the others in the process. This adds real enforcers for Workers that
+have limits, in a new file (src/workerd/server/factory/koedodb-limits.{h,c++}); Workers without limits keep the
+original Null enforcers.
+
+Limits per Worker (0 = none): cpuMs (thread CPU time of a request, summed over its JS runs), wallMs (wall
+clock of a request), heapMb (V8 old generation of the Worker's isolate), externalMb (ArrayBuffer / typed
+array / WebAssembly memory, through a counting ArrayBuffer::Allocator), subrequests (per request).
+CPU and wall time are watched by one watchdog thread that calls TerminateExecution() on that isolate only;
+the heap limit uses ResourceConstraints plus a near-heap-limit callback that ends the running request and
+gives the heap room to unwind (a refusal of the ArrayBuffer allocator that V8 reports through the same
+callback while the heap is far from full is not treated as heap exhaustion: the tenant gets its RangeError).
+After a termination the isolate is resumed (CancelTerminateExecution) so the Worker's next request works.
+Exceeded limits are reported through the existing LimitEnforcer hooks (onLimitsExceeded, getLimitsExceeded,
+requireLimitsNotExceeded) with the CPU / WALL_TIME / MEMORY detail IDs.
+
+The limits come from WORKERD_KOEDODB_LIMITS (or the file named by WORKERD_KOEDODB_LIMITS_FILE):
+  <worker name>|*=cpu:50,wall:5000,heap:64,ext:128,sub:50 ; ...
+
+Edits outside the new file: three small ones in worker-factory.c++ (create the isolate enforcer and the request
+enforcer through the new functions; the isolate group is made before the enforcer so that the counting
+allocator can wrap the group's default allocator) and the two names in the factory's BUILD.bazel.
+---
+ src/workerd/server/factory/BUILD.bazel        |   2 +
+ src/workerd/server/factory/koedodb-limits.c++ | 707 ++++++++++++++++++
+ src/workerd/server/factory/koedodb-limits.h   |  57 ++
+ src/workerd/server/factory/worker-factory.c++ |  20 +-
+ 4 files changed, 783 insertions(+), 3 deletions(-)
+ create mode 100644 src/workerd/server/factory/koedodb-limits.c++
+ create mode 100644 src/workerd/server/factory/koedodb-limits.h
+
+diff --git a/src/workerd/server/factory/BUILD.bazel b/src/workerd/server/factory/BUILD.bazel
+index 5e7e52b96..51fb0ad43 100644
+--- a/src/workerd/server/factory/BUILD.bazel
++++ b/src/workerd/server/factory/BUILD.bazel
+@@ -27,6 +27,8 @@ wd_cc_library(
+ wd_cc_library(
+     name = "worker-factory",
+     srcs = [
++        "koedodb-limits.c++",
++        "koedodb-limits.h",
+         "worker-factory.c++",
+         "worker-factory-actor.c++",
+         "worker-factory-impl.h",
+diff --git a/src/workerd/server/factory/koedodb-limits.c++ b/src/workerd/server/factory/koedodb-limits.c++
+new file mode 100644
+index 000000000..77b4c0b6e
+--- /dev/null
++++ b/src/workerd/server/factory/koedodb-limits.c++
+@@ -0,0 +1,707 @@
++// Copyright (c) 2026 RadarWorks LLC (KoedoDB). Licensed under the Apache License, Version 2.0.
++
++#include "koedodb-limits.h"
++
++#include <workerd/io/io-context.h>
++#include <workerd/io/tracked-wasm-instance.h>
++#include <workerd/io/worker.h>
++#include <workerd/jsg/exception.h>
++#include <workerd/jsg/jsg.h>
++#include <workerd/util/exception.h>
++
++#include <pthread.h>
++#include <time.h>
++
++#include <atomic>
++#include <cstdio>
++#include <chrono>
++#include <condition_variable>
++#include <cstdlib>
++#include <fstream>
++#include <list>
++#include <map>
++#include <memory>
++#include <mutex>
++#include <sstream>
++#include <string>
++#include <thread>
++
++#include <kj/async.h>
++#include <kj/debug.h>
++
++namespace workerd::server::koedodb {
++
++namespace {
++
++// ---------------------------------------------------------------------------------------------
++// Limits from the environment.
++
++WorkerLimits parseLimitSet(const std::string& spec) {
++  WorkerLimits l;
++  std::stringstream ss(spec);
++  std::string item;
++  while (std::getline(ss, item, ',')) {
++    auto colon = item.find(':');
++    if (colon == std::string::npos) continue;
++    std::string key = item.substr(0, colon);
++    uint32_t value = static_cast<uint32_t>(std::strtoul(item.c_str() + colon + 1, nullptr, 10));
++    // Trim spaces of the key.
++    while (!key.empty() && key.front() == ' ') key.erase(key.begin());
++    while (!key.empty() && key.back() == ' ') key.pop_back();
++    if (key == "cpu") l.cpuMs = value;
++    else if (key == "wall") l.wallMs = value;
++    else if (key == "heap") l.heapMb = value;
++    else if (key == "ext") l.externalMb = value;
++    else if (key == "sub") l.subrequests = value;
++  }
++  return l;
++}
++
++struct LimitTable {
++  std::map<std::string, WorkerLimits> byName;
++  WorkerLimits fallback;
++  bool hasFallback = false;
++};
++
++LimitTable loadTable() {
++  std::string text;
++  if (const char* file = std::getenv("WORKERD_KOEDODB_LIMITS_FILE")) {
++    std::ifstream in(file);
++    std::stringstream buf;
++    buf << in.rdbuf();
++    text = buf.str();
++  } else if (const char* env = std::getenv("WORKERD_KOEDODB_LIMITS")) {
++    text = env;
++  }
++  LimitTable table;
++  for (char& c: text) {
++    if (c == '\n' || c == '\r') c = ';';
++  }
++  std::stringstream ss(text);
++  std::string entry;
++  while (std::getline(ss, entry, ';')) {
++    auto eq = entry.find('=');
++    if (eq == std::string::npos) continue;
++    std::string name = entry.substr(0, eq);
++    while (!name.empty() && name.front() == ' ') name.erase(name.begin());
++    while (!name.empty() && name.back() == ' ') name.pop_back();
++    WorkerLimits limits = parseLimitSet(entry.substr(eq + 1));
++    if (name == "*") {
++      table.fallback = limits;
++      table.hasFallback = true;
++    } else {
++      table.byName[name] = limits;
++    }
++  }
++  return table;
++}
++
++const LimitTable& table() {
++  static const LimitTable t = loadTable();
++  return t;
++}
++
++// ---------------------------------------------------------------------------------------------
++// Exceptions
++
++enum class Exceeded : int { NONE = 0, CPU = 1, WALL = 2, MEMORY = 3 };
++
++kj::Exception makeExceeded(Exceeded kind) {
++  switch (kind) {
++    case Exceeded::CPU: {
++      auto e = JSG_KJ_EXCEPTION(OVERLOADED, Error, "Worker exceeded CPU time limit.");
++      e.setDetail(CPU_LIMIT_DETAIL_ID, kj::heapArray<kj::byte>(0));
++      return e;
++    }
++    case Exceeded::WALL: {
++      auto e = JSG_KJ_EXCEPTION(OVERLOADED, Error, "Worker exceeded wall-clock time limit.");
++      e.setDetail(WALL_TIME_LIMIT_DETAIL_ID, kj::heapArray<kj::byte>(0));
++      return e;
++    }
++    case Exceeded::MEMORY:
++    default: {
++      auto e = JSG_KJ_EXCEPTION(OVERLOADED, Error, "Worker exceeded memory limit.");
++      e.setDetail(MEMORY_LIMIT_DETAIL_ID, kj::heapArray<kj::byte>(0));
++      return e;
++    }
++  }
++}
++
++kj::Maybe<EventOutcome> outcomeOf(Exceeded kind) {
++  switch (kind) {
++    case Exceeded::CPU:
++      return EventOutcome::EXCEEDED_CPU;
++    case Exceeded::WALL:
++      return EventOutcome::EXCEEDED_WALL_TIME;
++    case Exceeded::MEMORY:
++      return EventOutcome::EXCEEDED_MEMORY;
++    default:
++      return kj::none;
++  }
++}
++
++// ---------------------------------------------------------------------------------------------
++// ArrayBuffer memory of one isolate, counted, with a cap.
++
++class CountingAllocator final: public v8::ArrayBuffer::Allocator {
++ public:
++  CountingAllocator(std::unique_ptr<v8::ArrayBuffer::Allocator> inner, size_t cap)
++      : inner(std::move(inner)),
++        cap(cap) {}
++
++  void* Allocate(size_t length) override {
++    if (!reserve(length)) return nullptr;
++    void* p = inner->Allocate(length);
++    if (p == nullptr) release(length);
++    return p;
++  }
++  void* AllocateUninitialized(size_t length) override {
++    if (!reserve(length)) return nullptr;
++    void* p = inner->AllocateUninitialized(length);
++    if (p == nullptr) release(length);
++    return p;
++  }
++  void Free(void* data, size_t length) override {
++    inner->Free(data, length);
++    release(length);
++  }
++
++  size_t used() const {
++    return usedBytes.load(std::memory_order_relaxed);
++  }
++  uint64_t refusals() const {
++    return refused.load(std::memory_order_relaxed);
++  }
++
++ private:
++  bool reserve(size_t n) {
++    size_t cur = usedBytes.load(std::memory_order_relaxed);
++    for (;;) {
++      if (cap != 0 && (n > cap || cur > cap - n)) {
++        uint64_t count = refused.fetch_add(1, std::memory_order_relaxed) + 1;
++        // Log the 1st, 2nd, 4th, 8th ... refusal: a tenant in a loop must not flood the log.
++        if ((count & (count - 1)) == 0) {
++          fprintf(stderr, "koedodb-limits: ArrayBuffer allocation of %zu bytes refused (used %zu, cap %zu, refusal #%llu)\n",
++              n, cur, cap, (unsigned long long)count);
++        }
++        return false;
++      }
++      if (usedBytes.compare_exchange_weak(cur, cur + n, std::memory_order_relaxed)) return true;
++    }
++  }
++  void release(size_t n) {
++    usedBytes.fetch_sub(n, std::memory_order_relaxed);
++  }
++
++  std::unique_ptr<v8::ArrayBuffer::Allocator> inner;
++  size_t cap;
++  std::atomic<size_t> usedBytes{0};
++  std::atomic<uint64_t> refused{0};
++};
++
++// ---------------------------------------------------------------------------------------------
++// The watchdog: one thread that ends JavaScript which runs over its CPU budget or whose request
++// is over its wall-clock budget.
++
++// Who is told when a budget is used up. Implemented by the per-request enforcer and by the
++// startup scopes. Called on the watchdog thread with the watchdog's mutex held: keep it short.
++class Target {
++ public:
++  virtual void cpuExceeded() = 0;
++  virtual void wallExceeded() = 0;
++};
++
++int64_t cpuNowNs(clockid_t clock) {
++  timespec ts;
++  if (clock_gettime(clock, &ts) != 0) return 0;
++  return int64_t(ts.tv_sec) * 1'000'000'000 + ts.tv_nsec;
++}
++
++class Watchdog {
++ public:
++  struct CpuEntry {
++    v8::Isolate* isolate;
++    clockid_t clock;
++    int64_t deadlineNs;  // absolute, on `clock`
++    Target* target;
++    bool fired = false;
++  };
++  struct WallEntry {
++    Target* target;
++    std::chrono::steady_clock::time_point deadline;
++    // The JS scope of the request that is running now, so that JS can be ended; null if none.
++    CpuEntry* running = nullptr;
++    v8::Isolate* isolate = nullptr;
++    bool fired = false;
++  };
++
++  static Watchdog& get() {
++    static Watchdog* w = new Watchdog();  // never destroyed: the thread outlives static teardown
++    return *w;
++  }
++
++  using CpuHandle = std::list<CpuEntry>::iterator;
++  using WallHandle = std::list<WallEntry>::iterator;
++
++  CpuHandle addCpu(v8::Isolate* isolate, clockid_t clock, int64_t deadlineNs, Target* target) {
++    std::lock_guard<std::mutex> lk(mu);
++    cpu.push_back(CpuEntry{isolate, clock, deadlineNs, target});
++    auto it = std::prev(cpu.end());
++    cv.notify_one();
++    return it;
++  }
++  bool removeCpu(CpuHandle it) {
++    std::lock_guard<std::mutex> lk(mu);
++    bool fired = it->fired;
++    cpu.erase(it);
++    return fired;
++  }
++
++  WallHandle addWall(Target* target, std::chrono::milliseconds limit) {
++    std::lock_guard<std::mutex> lk(mu);
++    wall.push_back(WallEntry{target, std::chrono::steady_clock::now() + limit});
++    auto it = std::prev(wall.end());
++    cv.notify_one();
++    return it;
++  }
++  // The request's JS is running (isolate) or has stopped (null).
++  void setWallRunning(WallHandle it, v8::Isolate* isolate) {
++    std::lock_guard<std::mutex> lk(mu);
++    it->isolate = isolate;
++  }
++  void removeWall(WallHandle it) {
++    std::lock_guard<std::mutex> lk(mu);
++    wall.erase(it);
++  }
++
++ private:
++  Watchdog() {
++    thread = std::thread([this]() { run(); });
++    thread.detach();
++  }
++
++  void run() {
++    std::unique_lock<std::mutex> lk(mu);
++    for (;;) {
++      if (cpu.empty() && wall.empty()) {
++        cv.wait(lk);
++        continue;
++      }
++      auto now = std::chrono::steady_clock::now();
++      for (auto& w: wall) {
++        if (!w.fired && now >= w.deadline) {
++          w.fired = true;
++          w.target->wallExceeded();
++          if (w.isolate != nullptr) w.isolate->TerminateExecution();
++        }
++      }
++      for (auto& c: cpu) {
++        if (!c.fired && cpuNowNs(c.clock) >= c.deadlineNs) {
++          c.fired = true;
++          c.target->cpuExceeded();
++          c.isolate->TerminateExecution();
++        }
++      }
++      cv.wait_for(lk, std::chrono::milliseconds(cpu.empty() ? 10 : 1));
++    }
++  }
++
++  std::mutex mu;
++  std::condition_variable cv;
++  std::list<CpuEntry> cpu;
++  std::list<WallEntry> wall;
++  std::thread thread;
++};
++
++// ---------------------------------------------------------------------------------------------
++// State shared by the isolate enforcer and the request enforcers of one Worker.
++
++class RequestEnforcer;
++
++struct WorkerState {
++  std::string name;
++  WorkerLimits limits;
++  std::shared_ptr<CountingAllocator> allocator;
++  std::atomic<v8::Isolate*> isolate{nullptr};
++  std::atomic<uint32_t> heapHits{0};
++  // The request whose JavaScript is running on the isolate now (the isolate runs one at a time).
++  std::atomic<RequestEnforcer*> running{nullptr};
++};
++
++std::mutex registryMutex;
++std::map<std::string, std::shared_ptr<WorkerState>>& registry() {
++  static auto* r = new std::map<std::string, std::shared_ptr<WorkerState>>();
++  return *r;
++}
++
++std::shared_ptr<WorkerState> findState(kj::StringPtr name) {
++  std::lock_guard<std::mutex> lk(registryMutex);
++  auto it = registry().find(std::string(name.cStr()));
++  return it == registry().end() ? nullptr : it->second;
++}
++
++// ---------------------------------------------------------------------------------------------
++// The per-request enforcer.
++
++class RequestEnforcer final: public LimitEnforcer, public kj::Refcounted, public Target {
++ public:
++  explicit RequestEnforcer(std::shared_ptr<WorkerState> state)
++      : state(std::move(state)),
++        cpuBudgetNs(int64_t(this->state->limits.cpuMs) * 1'000'000) {
++    auto pair = kj::newPromiseAndCrossThreadFulfiller<void>();
++    exceededPromise = pair.promise.fork();
++    fulfiller = kj::mv(pair.fulfiller);
++    if (this->state->limits.wallMs != 0) {
++      wallHandle = Watchdog::get().addWall(
++          this, std::chrono::milliseconds(this->state->limits.wallMs));
++    }
++  }
++
++  ~RequestEnforcer() noexcept(false) {
++    KJ_IF_SOME(h, wallHandle) {
++      Watchdog::get().removeWall(h);
++    }
++    // Do not leave the abort promise rejected-by-destruction: that would abort a request that
++    // is only finishing.
++    if (!fulfilled.exchange(true)) fulfiller->fulfill();
++  }
++
++  // --- Target (watchdog thread)
++  void cpuExceeded() override {
++    mark(Exceeded::CPU);
++  }
++  void wallExceeded() override {
++    mark(Exceeded::WALL);
++  }
++  void memoryExceeded() {
++    mark(Exceeded::MEMORY);
++  }
++
++  // --- LimitEnforcer
++  kj::Own<void> enterJs(jsg::Lock& lock, IoContext& context) override;
++
++  void topUpActor() override {}
++
++  void newSubrequest(bool isInHouse) override {
++    if (isInHouse || state->limits.subrequests == 0) return;
++    if (++subrequestCount > state->limits.subrequests) {
++      JSG_FAIL_REQUIRE(Error, "Too many subrequests.");
++    }
++  }
++  void newKvRequest(KvOpType op) override {}
++  void newAnalyticsEngineRequest() override {}
++  kj::Promise<void> limitDrain() override {
++    return kj::NEVER_DONE;
++  }
++  kj::Promise<void> limitScheduled() override {
++    return kj::NEVER_DONE;
++  }
++  kj::Duration getAlarmLimit() override {
++    return 15 * kj::MINUTES;
++  }
++  size_t getBufferingLimit() override {
++    return state->limits.externalMb != 0 ? size_t(state->limits.externalMb) << 20 : kj::maxValue;
++  }
++  kj::Maybe<EventOutcome> getLimitsExceeded() override {
++    return outcomeOf(Exceeded(exceeded.load()));
++  }
++  kj::Promise<void> onLimitsExceeded() override {
++    return exceededPromise.addBranch();
++  }
++  void setCpuLimitNearlyExceededCallback(kj::Function<void(void)> cb) override {}
++  void requireLimitsNotExceeded() override {
++    auto kind = Exceeded(exceeded.load());
++    if (kind != Exceeded::NONE) kj::throwFatalException(makeExceeded(kind));
++  }
++  void reportMetrics(RequestObserver& requestMetrics) override {}
++  kj::Duration consumeTimeElapsedForPeriodicLogging() override {
++    return 0 * kj::SECONDS;
++  }
++  size_t getSqliteMemoryUsage() const override {
++    return 0;
++  }
++
++  bool hasExceeded() const {
++    return exceeded.load() != int(Exceeded::NONE);
++  }
++
++  WorkerState& workerState() {
++    return *state;
++  }
++  int64_t cpuBudgetRemainingNs() const {
++    return cpuBudgetNs - cpuUsedNs.load();
++  }
++  void addCpuUsed(int64_t ns) {
++    cpuUsedNs.fetch_add(ns);
++  }
++  bool hasCpuLimit() const {
++    return state->limits.cpuMs != 0;
++  }
++  kj::Maybe<Watchdog::WallHandle>& wall() {
++    return wallHandle;
++  }
++
++ private:
++  void mark(Exceeded kind) {
++    int expected = int(Exceeded::NONE);
++    if (exceeded.compare_exchange_strong(expected, int(kind))) {
++      if (!fulfilled.exchange(true)) fulfiller->reject(makeExceeded(kind));
++    }
++  }
++
++  std::shared_ptr<WorkerState> state;
++  int64_t cpuBudgetNs;
++  std::atomic<int64_t> cpuUsedNs{0};
++  std::atomic<int> exceeded{int(Exceeded::NONE)};
++  std::atomic<bool> fulfilled{false};
++  std::atomic<uint32_t> subrequestCount{0};
++  kj::Own<kj::CrossThreadPromiseFulfiller<void>> fulfiller;
++  kj::ForkedPromise<void> exceededPromise{nullptr};
++  kj::Maybe<Watchdog::WallHandle> wallHandle;
++};
++
++// The scope of one run of JavaScript of a request.
++class JsScope final {
++ public:
++  JsScope(RequestEnforcer& enforcer, v8::Isolate* isolate): enforcer(enforcer), isolate(isolate) {
++    auto& st = enforcer.workerState();
++    previousRunning = st.running.exchange(&enforcer);
++    if (enforcer.hasCpuLimit()) {
++      pthread_getcpuclockid(pthread_self(), &clock);
++      startNs = cpuNowNs(clock);
++      int64_t remaining = enforcer.cpuBudgetRemainingNs();
++      cpuHandle = Watchdog::get().addCpu(isolate, clock, startNs + (remaining > 0 ? remaining : 0),
++          &enforcer);
++    }
++    KJ_IF_SOME(w, enforcer.wall()) {
++      Watchdog::get().setWallRunning(w, isolate);
++    }
++  }
++
++  ~JsScope() noexcept(false) {
++    KJ_IF_SOME(w, enforcer.wall()) {
++      Watchdog::get().setWallRunning(w, nullptr);
++    }
++    bool terminatedByUs = enforcer.hasExceeded();
++    KJ_IF_SOME(h, cpuHandle) {
++      Watchdog::get().removeCpu(h);
++      enforcer.addCpuUsed(cpuNowNs(clock) - startNs);
++    }
++    enforcer.workerState().running.store(previousRunning);
++    // JavaScript has stopped: resume the isolate for the next request, if it was we who ended it.
++    if (terminatedByUs && isolate->IsExecutionTerminating()) {
++      isolate->CancelTerminateExecution();
++    }
++  }
++
++  KJ_DISALLOW_COPY_AND_MOVE(JsScope);
++
++ private:
++  RequestEnforcer& enforcer;
++  v8::Isolate* isolate;
++  RequestEnforcer* previousRunning = nullptr;
++  clockid_t clock = CLOCK_THREAD_CPUTIME_ID;
++  int64_t startNs = 0;
++  kj::Maybe<Watchdog::CpuHandle> cpuHandle;
++};
++
++kj::Own<void> RequestEnforcer::enterJs(jsg::Lock& lock, IoContext& context) {
++  return kj::heap<JsScope>(*this, lock.v8Isolate);
++}
++
++// ---------------------------------------------------------------------------------------------
++// The per-isolate enforcer.
++
++// A scope for startup (module evaluation) and the like, with its own CPU budget and no request.
++class StartupTarget final: public Target {
++ public:
++  void cpuExceeded() override {
++    hit.store(true);
++  }
++  void wallExceeded() override {}
++  std::atomic<bool> hit{false};
++};
++
++class StartupScope final {
++ public:
++  StartupScope(v8::Isolate* isolate,
++      uint32_t budgetMs,
++      kj::OneOf<kj::Exception, kj::Duration>& out)
++      : isolate(isolate),
++        out(out) {
++    if (budgetMs != 0) {
++      pthread_getcpuclockid(pthread_self(), &clock);
++      startNs = cpuNowNs(clock);
++      handle = Watchdog::get().addCpu(isolate, clock, startNs + int64_t(budgetMs) * 1'000'000,
++          &target);
++    }
++  }
++  ~StartupScope() noexcept(false) {
++    KJ_IF_SOME(h, handle) {
++      Watchdog::get().removeCpu(h);
++    }
++    if (target.hit.load()) {
++      out = makeExceeded(Exceeded::CPU);
++      if (isolate->IsExecutionTerminating()) isolate->CancelTerminateExecution();
++    }
++  }
++  KJ_DISALLOW_COPY_AND_MOVE(StartupScope);
++
++ private:
++  v8::Isolate* isolate;
++  kj::OneOf<kj::Exception, kj::Duration>& out;
++  StartupTarget target;
++  clockid_t clock = CLOCK_THREAD_CPUTIME_ID;
++  int64_t startNs = 0;
++  kj::Maybe<Watchdog::CpuHandle> handle;
++};
++
++size_t nearHeapLimit(void* data, size_t currentLimit, size_t initialLimit) {
++  auto* st = static_cast<WorkerState*>(data);
++  // V8 also calls this when an ArrayBuffer allocation was refused and its last-resort garbage collection
++  // found nothing to free, although the JavaScript heap itself is far from full: then the tenant must
++  // get the RangeError (which it can catch) and not lose its request.
++  if (auto* iso = st->isolate.load()) {
++    v8::HeapStatistics stats;
++    iso->GetHeapStatistics(&stats);
++    if (stats.used_heap_size() < currentLimit / 100 * 80) return currentLimit + (8u << 20);
++  }
++  st->heapHits.fetch_add(1);
++  fprintf(stderr, "koedodb-limits: heap limit of %s reached: limit %zu MB, hits %u\n", st->name.c_str(),
++      currentLimit >> 20, st->heapHits.load());
++  if (auto* running = st->running.load()) running->memoryExceeded();
++  if (auto* iso = st->isolate.load()) iso->TerminateExecution();
++  // Room to unwind and for the garbage collector to finish; the heap shrinks again once the
++  // request that filled it is gone.
++  return currentLimit + (16u << 20);
++}
++
++class IsolateEnforcer final: public IsolateLimitEnforcer {
++ public:
++  IsolateEnforcer(std::shared_ptr<WorkerState> state, v8::IsolateGroup group)
++      : state(std::move(state)),
++        group(group) {}
++
++  v8::Isolate::CreateParams getCreateParams() override {
++    v8::Isolate::CreateParams params;
++    const auto& limits = state->limits;
++    if (limits.heapMb != 0) {
++      params.constraints.set_max_old_generation_size_in_bytes(size_t(limits.heapMb) << 20);
++    }
++    if (limits.externalMb != 0) {
++#ifdef V8_COMPRESS_POINTERS_IN_MULTIPLE_CAGES
++      std::unique_ptr<v8::ArrayBuffer::Allocator> inner(
++          v8::ArrayBuffer::Allocator::NewDefaultAllocator(group));
++#else
++      std::unique_ptr<v8::ArrayBuffer::Allocator> inner(
++          v8::ArrayBuffer::Allocator::NewDefaultAllocator());
++#endif
++      state->allocator = std::make_shared<CountingAllocator>(
++          std::move(inner), size_t(limits.externalMb) << 20);
++      params.array_buffer_allocator_shared = state->allocator;
++    }
++    return params;
++  }
++
++  void customizeIsolate(v8::Isolate* isolate) override {
++    state->isolate.store(isolate);
++    if (state->limits.heapMb != 0) {
++      isolate->AddNearHeapLimitCallback(&nearHeapLimit, state.get());
++    }
++  }
++
++  ActorCacheSharedLruOptions getActorCacheLruOptions() override {
++    return {.softLimit = 16 * (1ull << 20),
++      .hardLimit = 128 * (1ull << 20),
++      .staleTimeout = 30 * kj::SECONDS,
++      .dirtyListByteLimit = 8 * (1ull << 20),
++      .maxKeysPerRpc = 128,
++      .neverFlush = true};
++  }
++
++  kj::Own<void> enterStartupJs(
++      jsg::Lock& lock, kj::OneOf<kj::Exception, kj::Duration>& limitErrorOrTime) const override {
++    return startupScope(lock, limitErrorOrTime);
++  }
++  kj::Own<void> enterStartupPython(
++      jsg::Lock& lock, kj::OneOf<kj::Exception, kj::Duration>& limitErrorOrTime) const override {
++    return startupScope(lock, limitErrorOrTime);
++  }
++  kj::Own<void> enterDynamicImportJs(
++      jsg::Lock& lock, kj::OneOf<kj::Exception, kj::Duration>& limitErrorOrTime) const override {
++    return startupScope(lock, limitErrorOrTime);
++  }
++  kj::Own<void> enterLoggingJs(
++      jsg::Lock& lock, kj::OneOf<kj::Exception, kj::Duration>& limitErrorOrTime) const override {
++    return startupScope(lock, limitErrorOrTime);
++  }
++  kj::Own<void> enterInspectorJs(
++      jsg::Lock& lock, kj::OneOf<kj::Exception, kj::Duration>& limitErrorOrTime) const override {
++    return startupScope(lock, limitErrorOrTime);
++  }
++
++  void completedRequest(kj::StringPtr id) const override {}
++
++  bool exitJs(jsg::Lock& lock) const override {
++    return false;
++  }
++
++  void reportMetrics(IsolateObserver& isolateMetrics) const override {}
++
++  kj::Maybe<size_t> checkPbkdfIterations(jsg::Lock& lock, size_t iterations) const override {
++    return kj::none;
++  }
++
++  bool hasExcessivelyExceededHeapLimit() const override {
++    return state->heapHits.load() >= 4;
++  }
++
++  const TrackedWasmInstanceList& getTrackedWasmInstances() const override {
++    return trackedWasmInstances;
++  }
++
++ private:
++  kj::Own<void> startupScope(
++      jsg::Lock& lock, kj::OneOf<kj::Exception, kj::Duration>& out) const {
++    // Startup runs the bundle's top-level code: give it more than a request gets.
++    uint32_t cpuMs = state->limits.cpuMs;
++    uint32_t budget = cpuMs == 0 ? 0 : std::max<uint32_t>(cpuMs * 5, 1000);
++    return kj::heap<StartupScope>(lock.v8Isolate, budget, out);
++  }
++
++  std::shared_ptr<WorkerState> state;
++  v8::IsolateGroup group;
++  TrackedWasmInstanceList trackedWasmInstances;
++};
++
++}  // namespace
++
++WorkerLimits limitsFor(kj::StringPtr name) {
++  const auto& t = table();
++  auto it = t.byName.find(std::string(name.cStr()));
++  if (it != t.byName.end()) return it->second;
++  if (t.hasFallback) return t.fallback;
++  return {};
++}
++
++kj::Maybe<kj::Own<IsolateLimitEnforcer>> newIsolateLimitEnforcer(
++    kj::StringPtr name, v8::IsolateGroup group) {
++  auto limits = limitsFor(name);
++  if (!limits.any()) return kj::none;
++  auto state = std::make_shared<WorkerState>();
++  state->name = name.cStr();
++  state->limits = limits;
++  {
++    std::lock_guard<std::mutex> lk(registryMutex);
++    registry()[state->name] = state;
++  }
++  return kj::Own<IsolateLimitEnforcer>(kj::refcounted<IsolateEnforcer>(std::move(state), group));
++}
++
++kj::Maybe<kj::Own<LimitEnforcer>> newRequestLimitEnforcer(kj::StringPtr name) {
++  auto state = findState(name);
++  if (state == nullptr) return kj::none;
++  return kj::Own<LimitEnforcer>(kj::refcounted<RequestEnforcer>(std::move(state)));
++}
++
++}  // namespace workerd::server::koedodb
+diff --git a/src/workerd/server/factory/koedodb-limits.h b/src/workerd/server/factory/koedodb-limits.h
+new file mode 100644
+index 000000000..89693e0d5
+--- /dev/null
++++ b/src/workerd/server/factory/koedodb-limits.h
+@@ -0,0 +1,57 @@
++// Copyright (c) 2026 RadarWorks LLC (KoedoDB). Licensed under the Apache License, Version 2.0.
++//
++// Per-Worker resource limits for the open-source workerd server, which otherwise runs with the
++// "single-tenant policy: no limits" enforcers (NullIsolateLimitEnforcer / NullLimitEnforcer in
++// worker-factory.c++). One tenant's Worker must not be able to stop the others in the same process:
++//
++//   heapMb      V8 old-generation limit of the Worker's isolate; reaching it ends the running request
++//               (TerminateExecution on that isolate only), the process lives.
++//   externalMb  bytes of ArrayBuffer / typed array / WebAssembly memory of the isolate; an allocation
++//               over the cap fails with a RangeError instead of growing until the cgroup OOM kill.
++//   cpuMs       CPU time of one request (thread CPU clock, summed over the request's JS runs).
++//   wallMs      wall-clock time of one request (also covers awaiting an upstream that never answers).
++//   subrequests number of subrequests one request may start.
++//
++// A value of 0 means "no limit". The limits come from the environment variable
++// WORKERD_KOEDODB_LIMITS (or the file named by WORKERD_KOEDODB_LIMITS_FILE), a list of entries
++//   <worker name>|*=cpu:50,wall:5000,heap:64,ext:128,sub:50 ; <worker name>=...
++// separated by ';' or newlines; '*' is the default for workers that have no entry.
++
++#pragma once
++
++#include <workerd/io/limit-enforcer.h>
++
++#include <v8.h>
++
++#include <kj/common.h>
++#include <kj/memory.h>
++#include <kj/string.h>
++
++namespace workerd::server::koedodb {
++
++struct WorkerLimits {
++  uint32_t cpuMs = 0;
++  uint32_t wallMs = 0;
++  uint32_t heapMb = 0;
++  uint32_t externalMb = 0;
++  uint32_t subrequests = 0;
++
++  bool any() const {
++    return cpuMs || wallMs || heapMb || externalMb || subrequests;
++  }
++};
++
++// The limits of the Worker called `name` (its own entry, else the '*' entry, else none).
++WorkerLimits limitsFor(kj::StringPtr name);
++
++// The enforcer of one isolate (one Worker); none when the Worker has no limits (the caller then keeps
++// the "no limits" enforcer). Also creates the per-Worker state that the per-request enforcers made by
++// newRequestLimitEnforcer() share.
++kj::Maybe<kj::Own<IsolateLimitEnforcer>> newIsolateLimitEnforcer(
++    kj::StringPtr name, v8::IsolateGroup group);
++
++// The enforcer of one request (one IoContext) of the Worker called `name`; none when the Worker has
++// no limits.
++kj::Maybe<kj::Own<LimitEnforcer>> newRequestLimitEnforcer(kj::StringPtr name);
++
++}  // namespace workerd::server::koedodb
+diff --git a/src/workerd/server/factory/worker-factory.c++ b/src/workerd/server/factory/worker-factory.c++
+index aab6ec55f..91d6632d1 100644
+--- a/src/workerd/server/factory/worker-factory.c++
++++ b/src/workerd/server/factory/worker-factory.c++
+@@ -23,6 +23,7 @@
+ #include <workerd/server/fallback-service.h>
+ #include <workerd/server/pyodide.h>
+ #include <workerd/server/workerd-api.h>
++#include <workerd/server/factory/koedodb-limits.h>
+ #include <workerd/util/autogate.h>
+ #include <workerd/util/strings.h>
+ #include <workerd/util/use-perfetto-categories.h>
+@@ -405,6 +406,15 @@ class NullLimitEnforcer final: public LimitEnforcer, public kj::Refcounted {
+   }
+ };
+ 
++// The enforcer of one request: the per-Worker limits of KoedoDB when the Worker has any (see
++// koedodb-limits.h), else the "no limits" policy above.
++kj::Own<LimitEnforcer> limitEnforcerFor(kj::StringPtr workerName) {
++  KJ_IF_SOME(enforcer, koedodb::newRequestLimitEnforcer(workerName)) {
++    return kj::mv(enforcer);
++  }
++  return kj::refcounted<NullLimitEnforcer>();
++}
++
+ // Records a request's outcome on its tracer, wrapping the WorkerInterface to observe failures.
+ class RequestObserverWithTracer final: public RequestObserver, public WorkerInterface {
+  public:
+@@ -1133,7 +1143,7 @@ kj::Own<WorkerInterface> createEntrypoint(CompiledWorker::Impl& worker,
+ 
+   auto ioChannelFactory = kj::rc<RustIoChannelFactory>(kj::addRef(worker), kj::mv(channels));
+   return newWorkerEntrypoint(threadContext, kj::atomicAddRef(worker.getWorker()),
+-      entrypointName.clone(), kj::mv(props), kj::mv(actor), kj::refcounted<NullLimitEnforcer>(), {},
++      entrypointName.clone(), kj::mv(props), kj::mv(actor), limitEnforcerFor(worker.name), {},
+       kj::mv(ioChannelFactory), kj::mv(observer), worker.waitUntilTasks, true, kj::mv(workerTracer),
+       kj::mv(metadata.cfBlobJson), kj::none, kj::mv(triggerContext), IsDynamicDispatch::NO,
+       kj::mv(accessInfo), kj::mv(metadata.restoredSelfTokenFactory), metadata.fromPersistentStub,
+@@ -1596,7 +1606,11 @@ kj::Promise<kj::Own<CompiledWorker>> factory_new_worker(const WorkerFactory& con
+   // The isolate of the Worker, or of the zygote that snapshots its startup.
+   auto makeIsolate = [&](kj::StringPtr isolateName, Worker::Isolate::InspectorPolicy policy,
+                          kj::Maybe<jsg::SnapshotConfig> snapshotConfig) {
+-    auto limitEnforcer = kj::refcounted<NullIsolateLimitEnforcer>();
++    auto group = jsg::newIsolateGroup();
++    kj::Own<IsolateLimitEnforcer> limitEnforcer = kj::refcounted<NullIsolateLimitEnforcer>();
++    KJ_IF_SOME(enforcer, koedodb::newIsolateLimitEnforcer(isolateName, group)) {
++      limitEnforcer = kj::mv(enforcer);
++    }
+     auto listeners = KJ_MAP(listener, spec.inbound_listeners) {
+       return Worker::Api::InboundListener{
+         .protocol = kj::str(listener.protocol),
+@@ -1605,7 +1619,7 @@ kj::Promise<kj::Own<CompiledWorker>> factory_new_worker(const WorkerFactory& con
+       };
+     };
+     auto api = kj::heap<WorkerdApi>(factory.v8System, featureFlags, extensions,
+-        limitEnforcer->getCreateParams(), jsg::newIsolateGroup(),
++        limitEnforcer->getCreateParams(), group,
+         kj::atomicRefcounted<JsgIsolateObserver>(), *factory.memoryCacheProvider,
+         options.pythonConfig, kj::mv(listeners), kj::mv(snapshotConfig));
+     Worker::LoggingOptions isolateLoggingOptions = options.loggingOptions;
+-- 
+2.53.0
+

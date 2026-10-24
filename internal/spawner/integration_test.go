@@ -305,7 +305,8 @@ func (r *rig) hammer(path string, bad *atomic.Int32) (stop func()) {
 func TestALoopIsStoppedByTheLooksAndTheNeighbourNeverFeelsIt(t *testing.T) {
 	// 5 looks of 200 ms: stopped after about a second (the defaults, 5 looks of 2 s, are about ten seconds: see the next test).
 	r := newRig(t, nil, nil)
-	r.mustPut("acme", fns{"loop": jsLoop, "hello": jsHello}, putOpts{})
+	// The function's own CPU limit is raised to its maximum so that the looks (about a second here) are what stops it: this is the backup, tested on its own.
+	r.mustPut("acme", fns{"loop": jsLoop, "hello": jsHello}, putOpts{fn: map[string]map[string]any{"loop": {"cpu_ms": 5000}}})
 	r.mustPut("globex", fns{"hello": jsHello}, putOpts{})
 	if a := r.call("/globex/hello"); a.status != 200 {
 		t.Fatalf("globex: %d", a.status)
@@ -337,8 +338,9 @@ func TestALoopIsStoppedInAboutTenSecondsWithTheDefaultSettings(t *testing.T) {
 	if testing.Short() {
 		t.Skip("takes about ten seconds")
 	}
-	r := newRig(t, map[string]string{"WD_LOOK_MS": "2000"}, map[string]string{"REQUEST_MS": "60000"})
-	r.mustPut("acme", fns{"loop": jsLoop, "hello": jsHello}, putOpts{})
+	// TurboFan on and a loop it compiles without interrupt checks: the function's own CPU limit cannot stop it (fnlimits_test.go), so the looks do, at about ten seconds.
+	r := newRig(t, map[string]string{"WD_LOOK_MS": "2000", "WD_V8_FLAGS": "none"}, map[string]string{"REQUEST_MS": "60000"})
+	r.mustPut("acme", fns{"loop": jsUninterruptible, "hello": jsHello}, putOpts{})
 	t0 := time.Now()
 	a := r.call("/acme/loop")
 	took := time.Since(t0)
@@ -355,7 +357,8 @@ func TestALoopIsStoppedInAboutTenSecondsWithTheDefaultSettings(t *testing.T) {
 
 func TestAProcessThatUsesTooMuchMemoryIsKilledAtTheLimitAndTheNeighbourIsUnharmed(t *testing.T) {
 	r := newRig(t, nil, map[string]string{"REQUEST_MS": "20000"})
-	r.mustPut("acme", fns{"bomb": jsBomb, "hello": jsHello}, putOpts{limits: map[string]any{"memory_mib": 160}})
+	// The function's own ArrayBuffer limit is raised to its maximum, so that the process limit (160 MiB) is what stops the bomb: the backup, tested on its own.
+	r.mustPut("acme", fns{"bomb": jsBomb, "hello": jsHello}, putOpts{limits: map[string]any{"memory_mib": 160}, fn: map[string]map[string]any{"bomb": {"external_mb": 512}}})
 	r.mustPut("globex", fns{"hello": jsHello}, putOpts{})
 	if a := r.call("/globex/hello"); a.status != 200 {
 		t.Fatalf("globex: %d", a.status)

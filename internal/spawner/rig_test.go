@@ -330,12 +330,17 @@ type fns map[string]string
 type putOpts struct {
 	secrets map[string]string
 	limits  map[string]any
+	fn      map[string]map[string]any // the limits of a function (heap_mb, cpu_ms, ...): the ones left out are the platform's defaults
 }
 
 func (r *rig) putBody(f fns, o putOpts) []byte {
 	functions := map[string]any{}
 	for name, src := range f {
-		functions[name] = map[string]string{"bundle": base64.StdEncoding.EncodeToString([]byte(src))}
+		fe := map[string]any{"bundle": base64.StdEncoding.EncodeToString([]byte(src))}
+		if l, ok := o.fn[name]; ok {
+			fe["limits"] = l
+		}
+		functions[name] = fe
 	}
 	body := map[string]any{"functions": functions}
 	if o.secrets != nil {

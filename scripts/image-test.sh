@@ -97,21 +97,21 @@ other "cat /proc/$gpid/environ" | grep -qi 'permission denied' && ok "a customer
 [ "$(docker exec "$sp" sh -c 'grep -rl sekrit /state /sockets 2>/dev/null | wc -l')" = 0 ] && ok "no secret is in a file in /state or /sockets" || bad "a secret is on disk"
 [ "$(docker logs "$sp" 2>&1 | grep -c sekrit)" = 0 ] && ok "no secret is in the spawner's log" || bad "a secret is in the log"
 
-# ---- a loop: stopped by the looks in about ten seconds (the router lets a request run for 30 s here, so that the request timeout does not get there first), the neighbour does not feel it, the next request is a fresh process
+# ---- a loop: stopped by the function's own CPU limit (the patched workerd: 1 s by default) and nothing is killed: the process lives on, the neighbour does not feel it
 t0=$(date +%s)
 get /acme/loop/ 30 >/dev/null
 stopped=$(( $(date +%s) - t0 ))
-[ "$stopped" -ge 5 ] && [ "$stopped" -le 25 ] && ok "the loop was stopped after about ${stopped} s" || bad "the loop was stopped after ${stopped} s"
-docker logs "$sp" 2>&1 | grep -q 'customer=acme reason=runaway' && ok "the log says why" || bad "no runaway kill in the log"
+[ "$stopped" -le 5 ] && ok "the loop was stopped after about ${stopped} s" || bad "the loop was stopped after ${stopped} s"
+docker logs "$sp" 2>&1 | grep -q 'Worker exceeded CPU time limit' && ok "the log says why (the function's CPU limit)" || bad "no CPU limit in the log"
+docker logs "$sp" 2>&1 | grep -q 'customer=acme reason=runaway' && bad "the spawner had to kill the process for the loop" || ok "the spawner did not have to kill anything"
 [ "$(body /globex/count/)" = 2 ] && ok "the neighbour kept its process while acme looped" || bad "the neighbour was restarted or hurt: $(body /globex/count/)"
-[ "$(body /acme/hello/)" = "hello 1 sekrit-acme" ] && ok "the next request of acme runs in a fresh process" || bad "acme after the loop: $(body /acme/hello/)"
+body /acme/hello/ | grep -Eq '^hello [0-9]+ sekrit-acme$' && ok "acme's other function answers after the loop" || bad "acme after the loop: $(body /acme/hello/)"
 
-# ---- a memory bomb: killed at the limit (256 MiB), the neighbour is not hurt
+# ---- a memory bomb: stopped at the function's own heap limit (256 MiB), the neighbour is not hurt
 get /acme/heap/ 20 >/dev/null
-for i in $(seq 40); do docker logs "$sp" 2>&1 | grep -q 'customer=acme reason=memory' && break; sleep 0.5; done
-docker logs "$sp" 2>&1 | grep -q 'customer=acme reason=memory' && ok "the memory bomb was killed at the limit" || bad "no memory kill in the log"
+docker logs "$sp" 2>&1 | grep -q 'heap limit of fn-heap reached' && ok "the memory bomb was stopped at the function's heap limit" || bad "no heap limit in the log"
 [ "$(body /globex/count/)" = 3 ] && ok "the neighbour is still the same process after the bomb" || bad "the neighbour after the bomb: $(body /globex/count/)"
-[ "$(body /acme/hello/)" = "hello 1 sekrit-acme" ] && ok "acme starts again after the bomb" || bad "acme after the bomb: $(body /acme/hello/)"
+body /acme/hello/ | grep -Eq '^hello [0-9]+ sekrit-acme$' && ok "acme answers after the bomb" || bad "acme after the bomb: $(body /acme/hello/)"
 
 echo "memory: the spawner $(docker exec "$sp" sh -c 'grep ^VmRSS /proc/1/status' | tr -s ' \t' ' '), the router $(docker exec "$rt" sh -c 'grep ^VmRSS /proc/1/status' | tr -s ' \t' ' ') (resident, with two customers put)"
 

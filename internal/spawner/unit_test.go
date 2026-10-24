@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/koedodb/functions/internal/wdconfig"
 )
 
 // Tests that need neither root nor workerd.
@@ -39,7 +41,7 @@ func TestTheSettingsAreReadAndATypoIsAnError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Control != "/sockets" || c.State != "/state" || c.RouterUID != 10001 || c.UIDBase != 20000 || c.UIDCount != 1000 || c.BudgetMiB != 1024 || c.MemoryMiB != 256 || c.CPUQuotaPct != 100 ||
+	if c.Control != "/sockets" || c.State != "/state" || c.RouterUID != 10001 || c.UIDBase != 20000 || c.UIDCount != 1000 || c.BudgetMiB != 1024 || c.MemoryMiB != 1024 || c.FnDefault.HeapMB != 256 || c.FnDefault.CPUMs != 1000 || c.FnDefault.WallMs != 8000 || c.CPUQuotaPct != 100 ||
 		c.Look != 2*time.Second || c.MemoryLook != 250*time.Millisecond || c.RunawayLooks != 5 || c.PidsLimit != 64 || c.Workerd != "/sup/workerd" || c.MaxCustomers != 1000 ||
 		!slices.Equal(c.ControlAllow, []string{"regional-agent"}) || c.ControlListen != ":9443" {
 		t.Errorf("defaults: %+v", c)
@@ -150,8 +152,21 @@ func TestADefinitionIsValidatedBeforeAnythingIsStartedAndTheLimitsAreCappedByThe
 	if e := s.Validate("acme", &d); e != nil {
 		t.Fatal(e)
 	}
-	if d.Limits.MemoryMiB != 256 || d.Limits.CPUQuotaPct != 100 || d.Limits.Pids != 64 {
+	if d.Limits.MemoryMiB != 1024 || d.Limits.CPUQuotaPct != 100 || d.Limits.Pids != 64 {
 		t.Errorf("the limits default to the platform's: %+v", d.Limits)
+	}
+	// Every function ends with all six limits set: the defaults for what the put left out (never "no limit"), the asked value when it is within the maximum.
+	d = good()
+	d.FnLimits = map[string]wdconfig.FnLimits{"hello": {CPUMs: 100, HeapMB: 64}}
+	if e := s.Validate("acme", &d); e != nil {
+		t.Fatal(e)
+	}
+	if got, want := d.FnLimits["hello"], (wdconfig.FnLimits{HeapMB: 64, CPUMs: 100, WallMs: 8000, ExternalMB: 128, Subrequests: 50, ConcurrentSubrequests: 32}); got != want {
+		t.Errorf("function limits: %+v, want %+v", got, want)
+	}
+	d = good()
+	if e := s.Validate("acme", &d); e != nil || d.FnLimits["hello"] != s.cfg.FnDefault {
+		t.Errorf("without limits a function gets the defaults: %v %+v", e, d.FnLimits["hello"])
 	}
 	d = good()
 	d.Limits = Limits{MemoryMiB: 64, CPUQuotaPct: 25, Pids: 16}
@@ -165,17 +180,24 @@ func TestADefinitionIsValidatedBeforeAnythingIsStartedAndTheLimitsAreCappedByThe
 		"too many functions": func(id *string, d *Definition) {
 			d.Functions = map[string][]byte{"a": {1}, "b": {1}, "c": {1}, "d": {1}}
 		},
-		"a bad function name":      func(id *string, d *Definition) { d.Functions = map[string][]byte{"../x": {1}} },
-		"an empty bundle":          func(id *string, d *Definition) { d.Functions = map[string][]byte{"a": {}} },
-		"a bundle too large":       func(id *string, d *Definition) { d.Functions = map[string][]byte{"a": make([]byte, 1001)} },
-		"too many secrets":         func(id *string, d *Definition) { d.Secrets = map[string]string{"A": "1", "B": "1", "C": "1"} },
-		"a bad secret name":        func(id *string, d *Definition) { d.Secrets = map[string]string{"A B": "1"} },
-		"a secret with a NUL":      func(id *string, d *Definition) { d.Secrets = map[string]string{"A": "x\x00y"} },
-		"a secret too long":        func(id *string, d *Definition) { d.Secrets = map[string]string{"A": strings.Repeat("x", 8193)} },
-		"more memory than allowed": func(id *string, d *Definition) { d.Limits.MemoryMiB = 257 },
-		"too little memory":        func(id *string, d *Definition) { d.Limits.MemoryMiB = 8 },
-		"more CPU than allowed":    func(id *string, d *Definition) { d.Limits.CPUQuotaPct = 101 },
-		"more processes":           func(id *string, d *Definition) { d.Limits.Pids = 65 },
+		"a bad function name":                      func(id *string, d *Definition) { d.Functions = map[string][]byte{"../x": {1}} },
+		"an empty bundle":                          func(id *string, d *Definition) { d.Functions = map[string][]byte{"a": {}} },
+		"a bundle too large":                       func(id *string, d *Definition) { d.Functions = map[string][]byte{"a": make([]byte, 1001)} },
+		"too many secrets":                         func(id *string, d *Definition) { d.Secrets = map[string]string{"A": "1", "B": "1", "C": "1"} },
+		"a bad secret name":                        func(id *string, d *Definition) { d.Secrets = map[string]string{"A B": "1"} },
+		"a secret with a NUL":                      func(id *string, d *Definition) { d.Secrets = map[string]string{"A": "x\x00y"} },
+		"a secret too long":                        func(id *string, d *Definition) { d.Secrets = map[string]string{"A": strings.Repeat("x", 8193)} },
+		"more memory than allowed":                 func(id *string, d *Definition) { d.Limits.MemoryMiB = 1025 },
+		"too little memory":                        func(id *string, d *Definition) { d.Limits.MemoryMiB = 8 },
+		"more CPU than allowed":                    func(id *string, d *Definition) { d.Limits.CPUQuotaPct = 101 },
+		"more processes":                           func(id *string, d *Definition) { d.Limits.Pids = 65 },
+		"a heap above the maximum":                 func(id *string, d *Definition) { d.FnLimits = map[string]wdconfig.FnLimits{"hello": {HeapMB: 513}} },
+		"a heap too small":                         func(id *string, d *Definition) { d.FnLimits = map[string]wdconfig.FnLimits{"hello": {HeapMB: 8}} },
+		"more CPU time than allowed":               func(id *string, d *Definition) { d.FnLimits = map[string]wdconfig.FnLimits{"hello": {CPUMs: 5001}} },
+		"a longer wall time than the router waits": func(id *string, d *Definition) { d.FnLimits = map[string]wdconfig.FnLimits{"hello": {WallMs: 9001}} },
+		"more subrequests": func(id *string, d *Definition) {
+			d.FnLimits = map[string]wdconfig.FnLimits{"hello": {Subrequests: 1001}}
+		},
 	}
 	for what, mutate := range bad {
 		id, d := "acme", good()
@@ -211,15 +233,18 @@ func TestThePutRefusesABodyThatIsNotExactlyADefinition(t *testing.T) {
 	b64 := base64.StdEncoding.EncodeToString([]byte("export default () => new Response('x')"))
 	fn := map[string]any{"hello": map[string]string{"bundle": b64}}
 	for what, body := range map[string]string{
-		"not JSON":          `{`,
-		"an unknown field":  putBody(t, map[string]any{"functions": fn, "uid": 0}),
-		"an unknown limit":  putBody(t, map[string]any{"functions": fn, "limits": map[string]any{"memory_mib": 64, "root": true}}),
-		"two values":        putBody(t, map[string]any{"functions": fn}) + `{}`,
-		"a bad base64":      putBody(t, map[string]any{"functions": map[string]any{"hello": map[string]string{"bundle": "***"}}}),
-		"a url-safe base64": putBody(t, map[string]any{"functions": map[string]any{"hello": map[string]string{"bundle": "-_-_"}}}),
-		"no function":       putBody(t, map[string]any{"functions": map[string]any{}}),
-		"a bad name":        putBody(t, map[string]any{"functions": map[string]any{"Hello": map[string]string{"bundle": b64}}}),
-		"a number secret":   `{"functions":{"hello":{"bundle":"` + b64 + `"}},"secrets":{"A":1}}`,
+		"not JSON":                           `{`,
+		"an unknown field":                   putBody(t, map[string]any{"functions": fn, "uid": 0}),
+		"an unknown limit":                   putBody(t, map[string]any{"functions": fn, "limits": map[string]any{"memory_mib": 64, "root": true}}),
+		"an unknown function limit":          putBody(t, map[string]any{"functions": map[string]any{"hello": map[string]any{"bundle": b64, "limits": map[string]any{"cpu_ms": 100, "unlimited": true}}}}),
+		"a function limit above the maximum": putBody(t, map[string]any{"functions": map[string]any{"hello": map[string]any{"bundle": b64, "limits": map[string]any{"cpu_ms": 999999}}}}),
+		"a negative function limit":          `{"functions":{"hello":{"bundle":"` + b64 + `","limits":{"cpu_ms":-1}}}}`,
+		"two values":                         putBody(t, map[string]any{"functions": fn}) + `{}`,
+		"a bad base64":                       putBody(t, map[string]any{"functions": map[string]any{"hello": map[string]string{"bundle": "***"}}}),
+		"a url-safe base64":                  putBody(t, map[string]any{"functions": map[string]any{"hello": map[string]string{"bundle": "-_-_"}}}),
+		"no function":                        putBody(t, map[string]any{"functions": map[string]any{}}),
+		"a bad name":                         putBody(t, map[string]any{"functions": map[string]any{"Hello": map[string]string{"bundle": b64}}}),
+		"a number secret":                    `{"functions":{"hello":{"bundle":"` + b64 + `"}},"secrets":{"A":1}}`,
 	} {
 		rec := controlRequest(s, "PUT", "/v1/customers/acme", body, "")
 		if rec.Code < 400 || rec.Code >= 500 {

@@ -1,7 +1,7 @@
 # How the functions run
 
-The supervisor runs a customer's functions on the **unmodified** [workerd](https://github.com/cloudflare/workerd), **one workerd process for each customer**, all of that customer's functions
-(Workers) in it. It is the only runtime. The limits that workerd does not have are applied from outside the process.
+The supervisor runs a customer's functions on [workerd](https://github.com/cloudflare/workerd) **with the KoedoDB patch**, **one workerd process for each customer**, all of that customer's functions
+(Workers) in it. It is the only runtime. **Each function's own limits** (heap, CPU time, wall time, ArrayBuffer memory, subrequests) are enforced inside workerd by the patch ([limits.md](limits.md)); the limits of the **whole process** are applied from outside, as the outer wall and a backup.
 
 ## How it works
 
@@ -21,11 +21,11 @@ The supervisor is two parts, a spawner and a router, for a VM that holds several
 
 ## The limits, and where each comes from
 
-workerd has no CPU time limit and no memory limit of its own (the limit enforcer of the open-source server does nothing). So:
+The open-source workerd has no CPU time limit and no memory limit of its own (its limit enforcer does nothing); the patch adds them per function ([limits.md](limits.md)). What is below is the **outer wall around the customer's whole process**, which stays as the backup if a function's own limit does not hold (WebAssembly memory is the known case):
 
 | Limit | With a cgroup (`WD_CGROUP_ROOT`) | Without one (a hardened Pod today) |
 |---|---|---|
-| Memory (`WD_MEMORY_MIB`, 256) | `memory.max` and no swap: the kernel stops it at once | the supervisor reads the resident memory every `WD_MEMORY_LOOK_MS` (250) and kills above the limit. **A bomb can overshoot between two looks** (a process fills hundreds of MiB in a second); the Pod's own memory limit is the last line, and the kernel kills the largest process of the Pod, which is workerd when the Pod holds one customer |
+| Memory (`WD_MEMORY_MIB`, 1024) | `memory.max` and no swap: the kernel stops it at once | the supervisor reads the resident memory every `WD_MEMORY_LOOK_MS` (250) and kills above the limit. **A bomb can overshoot between two looks** (a process fills hundreds of MiB in a second); the Pod's own memory limit is the last line, and the kernel kills the largest process of the Pod, which is workerd when the Pod holds one customer |
 | CPU (`WD_CPU_QUOTA_PCT`, 100) | `cpu.max`: a loop cannot use more than the quota | the Pod's CPU limit is the quota of the whole Pod |
 | A loop | `WD_RUNAWAY_LOOKS` (5) looks of `WD_LOOK_MS` (2 s) at 85% of the quota or more: killed with SIGKILL (a looping workerd does not see SIGTERM) after about **10 s**, using one core meanwhile | the same rule, from `/proc/<pid>/stat` |
 | Processes (`WD_PIDS`, 64) | `pids.max` | the Pod's limit |
@@ -54,4 +54,4 @@ That code path is unit-tested against a directory and has **not** run on a real 
 - The cgroup code path (`WD_CGROUP_ROOT`: `memory.max`, `cpu.max`, `pids.max`, a process cloned straight into its cgroup) has not run on a real delegated cgroup yet.
 - workerd's outbound `fetch` is workerd's default (public addresses). The network policy of the Pod is what keeps a function away from other Pods and the node.
 - WebSockets and long-lived streams are not tested.
-- The image is about 220 MiB: Debian's slim base, the CA certificates, the supervisor (about 5 MB) and the official workerd binary (about 135 MB). Nothing else: no Node, no npm.
+- The image is about 220 MiB: Debian's slim base, the CA certificates, the supervisor (about 5 MB) and the patched workerd binary (about 150 MB). Nothing else: no Node, no npm.

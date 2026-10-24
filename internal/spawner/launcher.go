@@ -145,13 +145,13 @@ func (l *launcher) begin(rs runSpec) (*begun, error) {
 		if err := writeFile(file, body, c.uid); err != nil {
 			return fail(err)
 		}
-		fns = append(fns, wdconfig.Function{Name: name, Bundle: file})
+		fns = append(fns, wdconfig.Function{Name: name, Bundle: file, Limits: c.fnLimits[name]})
 	}
 	var secretNames []string
 	if !rs.probe {
 		secretNames = c.secretNames()
 	}
-	text, err := wdconfig.Build(wdconfig.Spec{Base: runDir, CompatDate: l.cfg.Compat, Functions: fns, Secrets: secretNames})
+	text, err := wdconfig.Build(wdconfig.Spec{Base: runDir, CompatDate: l.cfg.Compat, Functions: fns, Secrets: secretNames, V8Flags: l.cfg.V8Flags})
 	if err != nil {
 		return fail(err)
 	}

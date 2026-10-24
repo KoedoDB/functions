@@ -28,7 +28,7 @@ One binary, `/sup/supervisor`, three modes: `spawner`, `router` and `child` (wha
 
 - **spawner** is the only privileged part and the only part that knows a bundle or a secret. It runs as root with `CAP_CHOWN`, `CAP_KILL`, `CAP_SETGID` and `CAP_SETUID` and **nothing else** (the test suite runs with exactly these four; the spawner refuses to start without them and logs a warning if it has more). It has two doors: the **control API** (HTTPS, mutual TLS, for the Regional Agent) and the **internal socket** (a Unix socket only the router's user can connect to).
 - **router** runs as an ordinary user (10001) with no capability and holds no bundle, no secret and no authority over customers. It faces the edge, routes, counts and limits. If it were compromised it could start and stop customers' processes and talk to their sockets, which is all it can reach.
-- **workerd** is the unmodified official binary, one process for each customer, **all of the customer's functions inside it** (each function is a Worker of that process). It is started on the customer's first request and stopped when idle or to make room (`internal/residents`: a least-recently-used pool under a memory budget).
+- **workerd** is the official source with the KoedoDB patch (per-function limits, [limits.md](limits.md)), one process for each customer, **all of the customer's functions inside it** (each function is a Worker of that process). It is started on the customer's first request and stopped when idle or to make room (`internal/residents`: a least-recently-used pool under a memory budget).
 
 ## What a customer's process gets
 
@@ -52,7 +52,7 @@ HTTPS with **mutual TLS and nothing else**: TLS 1.3, a client certificate signed
 
 ```
 PUT    /v1/customers/<id>
-       {"functions": {"hello": {"bundle": "<base64 of index.mjs>"}},
+       {"functions": {"hello": {"bundle": "<base64 of index.mjs>", "limits": {"heap_mb": 256, "cpu_ms": 1000}}},   per-function limits are optional
         "secrets":   {"API_KEY": "…"},
         "limits":    {"memory_mib": 128, "cpu_quota_pct": 50, "pids": 32}}      limits are optional
 DELETE /v1/customers/<id>                    204, or 404 if there is no such customer
@@ -144,7 +144,8 @@ All by environment variables; a value that is not a number is an error at start,
 | `SUPERVISOR_RESERVE_MIB` | 60 | what the two supervisors take |
 | `FN_ESTIMATE_MIB`, `FN_MIN_RESIDENCY_MS`, `FN_WAIT_MS`, `FN_MAX_WAITERS` | 50, 1000, 5000, 20 | the pool (`internal/residents`) |
 | `MAX_CUSTOMERS`, `MAX_FUNCTIONS`, `MAX_SECRETS`, `MAX_BUNDLE_BYTES`, `MAX_STATE_BYTES`, `MAX_PROBES` | 1000, 50, 64, 5 MiB, 256 MiB, 4 | what a put may hold |
-| `WD_MEMORY_MIB`, `WD_CPU_QUOTA_PCT`, `WD_PIDS` | 256, 100, 64 | the platform's maximum limits of one customer's process (a put may ask for less) |
+| `WD_MEMORY_MIB`, `WD_CPU_QUOTA_PCT`, `WD_PIDS` | 1024, 100, 64 | the platform's maximum limits of one customer's whole process, the outer wall (a put may ask for less) |
+| `FN_HEAP_MB`, `FN_CPU_MS`, `FN_WALL_MS`, `FN_EXTERNAL_MB`, `FN_SUBREQUESTS`, `FN_CONCURRENT_SUBREQUESTS` | 256, 1000, 8000, 128, 50, 32 | the limits of ONE function when the put says nothing; `FN_MAX_*` (512, 5000, 9000, 512, 1000, 256) are what a put may ask for at most ([limits.md](limits.md)) |
 | `WD_LOOK_MS`, `WD_RUNAWAY_LOOKS`, `WD_MEMORY_LOOK_MS` | 2000, 5, 250 | the looks |
 | `WD_CGROUP_ROOT` | | a writable cgroup v2 directory handed down to the spawner |
 

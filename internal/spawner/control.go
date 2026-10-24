@@ -3,7 +3,7 @@ package spawner
 // The control API: how the Regional Agent puts a customer's functions and secrets into the VM. HTTPS with mutual TLS only (TLS 1.3, a client certificate signed by CONTROL_CLIENT_CA whose
 // common name is in CONTROL_ALLOW_CN); there is no plain mode and no token. It is the only way a bundle or a secret gets in.
 //
-//	PUT    /v1/customers/<id>   {"functions": {"<name>": {"bundle": "<base64 of index.mjs>"}}, "secrets": {"NAME": "value"}, "limits": {"memory_mib": 128, "cpu_quota_pct": 50, "pids": 32}}
+//	PUT    /v1/customers/<id>   {"functions": {"<name>": {"bundle": "<base64 of index.mjs>", "limits": {"heap_mb": 256, "cpu_ms": 1000, "wall_ms": 8000, "external_mb": 128, "subrequests": 50, "concurrent_subrequests": 32}}}, "secrets": {"NAME": "value"}, "limits": {"memory_mib": 128, "cpu_quota_pct": 50, "pids": 32}}
 //	DELETE /v1/customers/<id>
 //	GET    /v1/customers        what the VM holds (never the secrets' values), for the Agent to reconcile after a restart: the state is in memory only
 //	GET    /v1/stats            the pool's statistics
@@ -28,6 +28,14 @@ import (
 type putRequest struct {
 	Functions map[string]struct {
 		Bundle string `json:"bundle"`
+		Limits *struct {
+			HeapMB                uint32 `json:"heap_mb"`
+			CPUMs                 uint32 `json:"cpu_ms"`
+			WallMs                uint32 `json:"wall_ms"`
+			ExternalMB            uint32 `json:"external_mb"`
+			Subrequests           uint32 `json:"subrequests"`
+			ConcurrentSubrequests uint32 `json:"concurrent_subrequests"`
+		} `json:"limits"`
 	} `json:"functions"`
 	Secrets map[string]string `json:"secrets"`
 	Limits  *struct {
@@ -118,7 +126,7 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "the body has more than one JSON value"})
 		return
 	}
-	def := Definition{Functions: map[string][]byte{}, Secrets: req.Secrets}
+	def := Definition{Functions: map[string][]byte{}, Secrets: req.Secrets, FnLimits: map[string]wdconfig.FnLimits{}}
 	for name, f := range req.Functions {
 		body, err := base64.StdEncoding.Strict().DecodeString(f.Bundle)
 		if err != nil {
@@ -126,6 +134,9 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		def.Functions[name] = body
+		if fl := f.Limits; fl != nil {
+			def.FnLimits[name] = wdconfig.FnLimits{HeapMB: fl.HeapMB, CPUMs: fl.CPUMs, WallMs: fl.WallMs, ExternalMB: fl.ExternalMB, Subrequests: fl.Subrequests, ConcurrentSubrequests: fl.ConcurrentSubrequests}
+		}
 	}
 	if req.Limits != nil {
 		def.Limits = Limits{MemoryMiB: req.Limits.MemoryMiB, CPUQuotaPct: req.Limits.CPUQuotaPct, Pids: req.Limits.Pids}

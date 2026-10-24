@@ -1,0 +1,107 @@
+From 0d1b354661cbe11bc3fb789572aa4bf5ded36ee2 Mon Sep 17 00:00:00 2001
+From: banil246 <igoigo246@gmail.com>
+Date: Sun, 18 Oct 2026 05:31:32 +0900
+Subject: [PATCH 2/3] koedodb limits: a cap on subrequests open at once per
+ Worker (bounds its file descriptors)
+
+'conc' counts the subrequests (fetch, WebSocket, cache) a Worker has open over all its requests; a subrequest
+counts until its request ends. A Worker that asks for more gets 'Too many concurrent subrequests.' The per-request
+'sub' limit alone does not bound descriptors when many requests run at once.
+---
+ src/workerd/server/factory/koedodb-limits.c++ | 17 +++++++++++++++--
+ src/workerd/server/factory/koedodb-limits.h   |  9 ++++++---
+ 2 files changed, 21 insertions(+), 5 deletions(-)
+
+diff --git a/src/workerd/server/factory/koedodb-limits.c++ b/src/workerd/server/factory/koedodb-limits.c++
+index 77b4c0b6e..0f28a4c08 100644
+--- a/src/workerd/server/factory/koedodb-limits.c++
++++ b/src/workerd/server/factory/koedodb-limits.c++
+@@ -53,6 +53,7 @@ WorkerLimits parseLimitSet(const std::string& spec) {
+     else if (key == "heap") l.heapMb = value;
+     else if (key == "ext") l.externalMb = value;
+     else if (key == "sub") l.subrequests = value;
++    else if (key == "conc") l.concurrentSubrequests = value;
+   }
+   return l;
+ }
+@@ -324,6 +325,8 @@ struct WorkerState {
+   std::shared_ptr<CountingAllocator> allocator;
+   std::atomic<v8::Isolate*> isolate{nullptr};
+   std::atomic<uint32_t> heapHits{0};
++  // Subrequests counted as open, over all the requests of the Worker (see WorkerLimits::concurrentSubrequests).
++  std::atomic<uint32_t> activeSubrequests{0};
+   // The request whose JavaScript is running on the isolate now (the isolate runs one at a time).
+   std::atomic<RequestEnforcer*> running{nullptr};
+ };
+@@ -361,6 +364,7 @@ class RequestEnforcer final: public LimitEnforcer, public kj::Refcounted, public
+     KJ_IF_SOME(h, wallHandle) {
+       Watchdog::get().removeWall(h);
+     }
++    state->activeSubrequests.fetch_sub(ownActiveSubrequests);
+     // Do not leave the abort promise rejected-by-destruction: that would abort a request that
+     // is only finishing.
+     if (!fulfilled.exchange(true)) fulfiller->fulfill();
+@@ -383,10 +387,18 @@ class RequestEnforcer final: public LimitEnforcer, public kj::Refcounted, public
+   void topUpActor() override {}
+ 
+   void newSubrequest(bool isInHouse) override {
+-    if (isInHouse || state->limits.subrequests == 0) return;
+-    if (++subrequestCount > state->limits.subrequests) {
++    if (isInHouse) return;
++    if (state->limits.subrequests != 0 && ++subrequestCount > state->limits.subrequests) {
+       JSG_FAIL_REQUIRE(Error, "Too many subrequests.");
+     }
++    if (state->limits.concurrentSubrequests != 0) {
++      uint32_t active = state->activeSubrequests.fetch_add(1) + 1;
++      if (active > state->limits.concurrentSubrequests) {
++        state->activeSubrequests.fetch_sub(1);
++        JSG_FAIL_REQUIRE(Error, "Too many concurrent subrequests.");
++      }
++      ownActiveSubrequests++;
++    }
+   }
+   void newKvRequest(KvOpType op) override {}
+   void newAnalyticsEngineRequest() override {}
+@@ -455,6 +467,7 @@ class RequestEnforcer final: public LimitEnforcer, public kj::Refcounted, public
+   std::atomic<int> exceeded{int(Exceeded::NONE)};
+   std::atomic<bool> fulfilled{false};
+   std::atomic<uint32_t> subrequestCount{0};
++  uint32_t ownActiveSubrequests = 0;
+   kj::Own<kj::CrossThreadPromiseFulfiller<void>> fulfiller;
+   kj::ForkedPromise<void> exceededPromise{nullptr};
+   kj::Maybe<Watchdog::WallHandle> wallHandle;
+diff --git a/src/workerd/server/factory/koedodb-limits.h b/src/workerd/server/factory/koedodb-limits.h
+index 89693e0d5..687683b7c 100644
+--- a/src/workerd/server/factory/koedodb-limits.h
++++ b/src/workerd/server/factory/koedodb-limits.h
+@@ -11,10 +11,12 @@
+ //   cpuMs       CPU time of one request (thread CPU clock, summed over the request's JS runs).
+ //   wallMs      wall-clock time of one request (also covers awaiting an upstream that never answers).
+ //   subrequests number of subrequests one request may start.
++//   conc        subrequests (fetch, WebSocket, cache) a Worker may have open at once over all its requests; a
++//               subrequest counts until its request ends, which is what bounds the Worker's file descriptors.
+ //
+ // A value of 0 means "no limit". The limits come from the environment variable
+ // WORKERD_KOEDODB_LIMITS (or the file named by WORKERD_KOEDODB_LIMITS_FILE), a list of entries
+-//   <worker name>|*=cpu:50,wall:5000,heap:64,ext:128,sub:50 ; <worker name>=...
++//   <worker name>|*=cpu:50,wall:5000,heap:64,ext:128,sub:50,conc:64 ; <worker name>=...
+ // separated by ';' or newlines; '*' is the default for workers that have no entry.
+ 
+ #pragma once
+@@ -34,10 +36,11 @@ struct WorkerLimits {
+   uint32_t wallMs = 0;
+   uint32_t heapMb = 0;
+   uint32_t externalMb = 0;
+-  uint32_t subrequests = 0;
++  uint32_t subrequests = 0;            // per request
++  uint32_t concurrentSubrequests = 0;  // open at once, over all requests of the Worker
+ 
+   bool any() const {
+-    return cpuMs || wallMs || heapMb || externalMb || subrequests;
++    return cpuMs || wallMs || heapMb || externalMb || subrequests || concurrentSubrequests;
+   }
+ };
+ 
+-- 
+2.53.0
+

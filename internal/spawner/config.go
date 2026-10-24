@@ -15,6 +15,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/koedodb/functions/internal/wdconfig"
 )
 
 // Config is the spawner's settings (README, "Settings").
@@ -62,7 +64,12 @@ type Config struct {
 	Look         time.Duration
 	MemoryLook   time.Duration
 	RunawayLooks int
-	CgroupRoot   string // a writable cgroup v2 directory handed down to the spawner: each customer's process gets a cgroup in it. Empty: no cgroup (the looks only)
+	// Limits of ONE function (a Worker of the customer's process), enforced inside workerd by the patch: the default is what a function gets when the put says nothing, the maximum is what
+	// a put may ask for. They stop that function only; the process limits above (the cgroup) are the outer wall around all of the customer's functions.
+	V8Flags    []string // WD_V8_FLAGS, space separated; "none" for no flag. Default wdconfig.DefaultV8Flags (--no-turbofan)
+	FnDefault  wdconfig.FnLimits
+	FnMax      wdconfig.FnLimits
+	CgroupRoot string // a writable cgroup v2 directory handed down to the spawner: each customer's process gets a cgroup in it. Empty: no cgroup (the looks only)
 }
 
 // ConfigFromEnv reads the settings from the environment. A value that is not a number is an error (a typo in a limit must not become the default). The settings that make the isolation
@@ -86,6 +93,12 @@ func ConfigFromEnv(lookup func(string) (string, bool), cgroupMemoryMiB func() (f
 			return def
 		}
 		return f
+	}
+	u32 := func(f float64) uint32 {
+		if f > 1<<32-1 {
+			return 1<<32 - 1
+		}
+		return uint32(f)
 	}
 	ms := func(key string, def int) time.Duration {
 		return time.Duration(num(key, float64(def))) * time.Millisecond
@@ -118,13 +131,33 @@ func ConfigFromEnv(lookup func(string) (string, bool), cgroupMemoryMiB func() (f
 		MaxStateBytes:  int64(num("MAX_STATE_BYTES", 256<<20)),
 		MaxSecrets:     int(num("MAX_SECRETS", 64)),
 		MaxProbes:      int(num("MAX_PROBES", 4)),
-		MemoryMiB:      num("WD_MEMORY_MIB", 256),
+		MemoryMiB:      num("WD_MEMORY_MIB", 1024), // the outer wall of the whole process of a customer; one function's heap is FnDefault.HeapMB (256)
 		CPUQuotaPct:    num("WD_CPU_QUOTA_PCT", 100),
 		PidsLimit:      int(num("WD_PIDS", 64)),
 		Look:           ms("WD_LOOK_MS", 2000),
 		MemoryLook:     ms("WD_MEMORY_LOOK_MS", 250),
 		RunawayLooks:   int(num("WD_RUNAWAY_LOOKS", 5)),
 		CgroupRoot:     str("WD_CGROUP_ROOT", ""),
+		FnDefault: wdconfig.FnLimits{
+			HeapMB: u32(num("FN_HEAP_MB", 256)), CPUMs: u32(num("FN_CPU_MS", 1000)), WallMs: u32(num("FN_WALL_MS", 8000)), ExternalMB: u32(num("FN_EXTERNAL_MB", 128)),
+			Subrequests: u32(num("FN_SUBREQUESTS", 50)), ConcurrentSubrequests: u32(num("FN_CONCURRENT_SUBREQUESTS", 32)),
+		},
+		// WallMs: the router gives up on a request after REQUEST_MS (10 s) and kills the process, so a function's wall limit must be reached first.
+		FnMax: wdconfig.FnLimits{
+			HeapMB: u32(num("FN_MAX_HEAP_MB", 512)), CPUMs: u32(num("FN_MAX_CPU_MS", 5000)), WallMs: u32(num("FN_MAX_WALL_MS", 9000)), ExternalMB: u32(num("FN_MAX_EXTERNAL_MB", 512)),
+			Subrequests: u32(num("FN_MAX_SUBREQUESTS", 1000)), ConcurrentSubrequests: u32(num("FN_MAX_CONCURRENT_SUBREQUESTS", 256)),
+		},
+	}
+	switch v := strings.TrimSpace(str("WD_V8_FLAGS", "")); v {
+	case "":
+		c.V8Flags = wdconfig.DefaultV8Flags
+	case "none":
+	default:
+		c.V8Flags = strings.Fields(v)
+	}
+	if d, m := c.FnDefault, c.FnMax; d.HeapMB == 0 || d.CPUMs == 0 || d.WallMs == 0 || d.ExternalMB == 0 || d.Subrequests == 0 || d.ConcurrentSubrequests == 0 ||
+		d.HeapMB > m.HeapMB || d.CPUMs > m.CPUMs || d.WallMs > m.WallMs || d.ExternalMB > m.ExternalMB || d.Subrequests > m.Subrequests || d.ConcurrentSubrequests > m.ConcurrentSubrequests {
+		errs = append(errs, "the FN_* limits of a function must be more than 0 (a function with no limit is never made) and not above the FN_MAX_* ones")
 	}
 	for _, name := range strings.Split(str("CONTROL_ALLOW_CN", ""), ",") {
 		if name = strings.TrimSpace(name); name != "" {

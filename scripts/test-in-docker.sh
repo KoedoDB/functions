@@ -23,7 +23,7 @@ status=0
 for p in spawner router wdconfig residents; do
   echo "=== $p"
   docker run --rm --user 0:0 --cap-drop ALL --cap-add CHOWN --cap-add KILL --cap-add SETGID --cap-add SETUID \
-    --read-only --security-opt no-new-privileges --tmpfs /tmp:rw,mode=1777,size=1g --memory 6g --memory-swap 6g --pids-limit 4096 \
+    --read-only --security-opt no-new-privileges --tmpfs /tmp:rw,mode=1777,size=1g --memory "${TEST_MEMORY:-6g}" --memory-swap "${TEST_MEMORY:-6g}" --pids-limit 4096 \
     -v "$out/$p.test":/t/test:ro -w /tmp -e WORKERD_BIN=/sup/workerd -e EXPECT_MINIMAL_CAPS=1 \
     --entrypoint /t/test "$IMAGE" -test.v -test.timeout 20m "$@" 2>&1 | grep -v '^=== RUN\|^=== PAUSE\|^=== CONT' || status=$?
   [ "${PIPESTATUS[0]}" = 0 ] || status=1
