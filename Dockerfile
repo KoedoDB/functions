@@ -7,7 +7,7 @@
 # One image, two containers of a Pod (docs/shared-vm.md): `spawner` runs as root with CAP_CHOWN, CAP_KILL, CAP_SETGID and CAP_SETUID and nothing else, `router` as user 10001 with no
 # capability. Both have a read-only root file system; the spawner needs /state (its own tmpfs) and /sockets (a tmpfs shared with the router), the router only /sockets. The image has no Node,
 # no npm and no shell tools of its own beyond what the base image has.
-FROM golang:1.26.10-trixie@sha256:909771fef53e3dcb0950255f0c9a8b4728c3b841e61509c7b29b098de7ee02d4 AS build
+FROM golang:1.27.3-trixie@sha256:fbb7ae40b62ff8afe31662df570d39b4f5052ac32b90dae8e60d7657a20a74f4 AS build
 WORKDIR /src
 COPY go.mod ./
 COPY cmd ./cmd
