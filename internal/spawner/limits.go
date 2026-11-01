@@ -152,11 +152,48 @@ func isCgroup2(dir string) bool {
 	return syscall.Statfs(dir, &st) == nil && int64(st.Type) == cgroup2Magic
 }
 
+// prepareCgroupRoot makes the directory of the supervisor's own cgroup fit to hold the customers' cgroups: cgroup v2 does not let a cgroup that holds a process hand controllers to its
+// children (the "no internal processes" rule), and a delegated cgroup (cchv's cgroup-delegate) starts with the supervisor in it and no controller enabled for its children. So the
+// supervisor moves itself into a leaf and then enables cpu, memory and pids for the children. Nothing is done when the three are enabled already (a directory made ready by the
+// one who handed it down, or by an earlier start).
+func prepareCgroupRoot(root string) error {
+	have, err := os.ReadFile(filepath.Join(root, "cgroup.subtree_control"))
+	if err != nil {
+		return err
+	}
+	enabled := strings.Fields(string(have))
+	missing := false
+	for _, c := range []string{"cpu", "memory", "pids"} {
+		found := false
+		for _, e := range enabled {
+			found = found || e == c
+		}
+		missing = missing || !found
+	}
+	if !missing {
+		return nil
+	}
+	leaf := filepath.Join(root, "supervisor")
+	if err := os.MkdirAll(leaf, 0o755); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(leaf, "cgroup.procs"), []byte("0"), 0o644); err != nil {
+		return fmt.Errorf("move the supervisor into %s: %w", leaf, err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "cgroup.subtree_control"), []byte("+cpu +memory +pids"), 0o644); err != nil {
+		return fmt.Errorf("enable cpu, memory and pids for the customers' cgroups: %w", err)
+	}
+	return nil
+}
+
 // newCgroup makes the cgroup of a customer and sets its limits: memory.max (and no swap), cpu.max (quotaPct of one core in a period of 100 ms) and pids.max. A file that is not
 // there (a controller that is not enabled in the parent) is an error for memory.max, cpu.max and pids.max: a limit that is not applied must not look as if it were.
 func newCgroup(root, customer string, memoryMiB, quotaPct float64, pids int) (*cgroup, error) {
-	if !wdconfig.NameRE.MatchString(customer) {
-		return nil, fmt.Errorf("%q is not a customer name", customer)
+	// The name of a process is "<customer>.<generation>.<number>" (or a probe's): every part between the dots must be a plain name, so that nothing can leave the directory.
+	for _, part := range strings.Split(customer, ".") {
+		if !wdconfig.NameRE.MatchString(part) {
+			return nil, fmt.Errorf("%q is not a customer name", customer)
+		}
 	}
 	dir := filepath.Join(root, "wd-"+customer)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -174,6 +211,10 @@ func newCgroup(root, customer string, memoryMiB, quotaPct float64, pids int) (*c
 		{"pids.max", strconv.Itoa(pids), false},
 	}
 	for _, w := range writes {
+		// An optional file that the kernel does not have (memory.swap.max in a guest without swap) is skipped on a cgroup file system (a test directory makes it); opening it for writing would not say "not found", it would be refused.
+		if _, err := os.Stat(filepath.Join(dir, w.file)); w.optional && os.IsNotExist(err) && isCgroup2(dir) {
+			continue
+		}
 		if err := os.WriteFile(filepath.Join(dir, w.file), []byte(w.value), 0o644); err != nil {
 			if w.optional && os.IsNotExist(err) {
 				continue

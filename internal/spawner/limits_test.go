@@ -121,3 +121,47 @@ func TestTheCgroupOfACustomerIsMadeWithItsLimits(t *testing.T) {
 		t.Errorf("memory.current: %v, %v", mib, ok)
 	}
 }
+
+func TestPrepareCgroupRootMovesIntoALeafAndEnablesTheControllers(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "cgroup.subtree_control"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := prepareCgroupRoot(dir); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := os.ReadFile(filepath.Join(dir, "cgroup.subtree_control"))
+	if string(got) != "+cpu +memory +pids" {
+		t.Errorf("subtree_control = %q", got)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "supervisor", "cgroup.procs")); err != nil {
+		t.Errorf("no leaf: %v", err)
+	}
+	// Ready already: nothing is made.
+	ready := t.TempDir()
+	if err := os.WriteFile(filepath.Join(ready, "cgroup.subtree_control"), []byte("cpu memory pids\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := prepareCgroupRoot(ready); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(ready, "supervisor")); err == nil {
+		t.Error("a leaf was made in a directory that was ready")
+	}
+}
+
+func TestTheCgroupOfAProcessIsNamedAfterItsCustomerGenerationAndNumber(t *testing.T) {
+	root := t.TempDir()
+	cg, err := newCgroup(root, "9039f1fd-6f22-4645-9129-5df5ec3fe18a.18.9205", 256, 100, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Dir(cg.dir) != root {
+		t.Errorf("the cgroup is %s", cg.dir)
+	}
+	for _, bad := range []string{"a/b", "../x", "a..b", ".x", "x."} {
+		if _, err := newCgroup(root, bad, 256, 100, 64); err == nil {
+			t.Errorf("%q was accepted", bad)
+		}
+	}
+}

@@ -7,6 +7,7 @@ package spawner
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"runtime"
 	"strconv"
@@ -17,12 +18,21 @@ import (
 // prSetNoNewPrivs is PR_SET_NO_NEW_PRIVS.
 const prSetNoNewPrivs = 38
 
-// ChildMain is "child [--nproc N] <workerd> <config>": it does not return when it works (workerd takes its place).
+// ChildMain is "child [--nproc N] [--gate-fd N] <workerd> <config>": it does not return when it works (workerd takes its place).
 func ChildMain(args []string) error {
 	// no_new_privs and the seccomp filter belong to a thread, and execve keeps those of the thread that calls it: stay on this one until workerd takes the process over.
 	runtime.LockOSThread()
 	nproc := 0
-	for len(args) >= 2 && args[0] == "--nproc" {
+	gateFD := -1
+	for len(args) >= 2 && (args[0] == "--nproc" || args[0] == "--gate-fd") {
+		if args[0] == "--gate-fd" {
+			n, err := strconv.Atoi(args[1])
+			if err != nil || n < 4 {
+				return errors.New("--gate-fd needs a file descriptor number of 4 or more")
+			}
+			gateFD, args = n, args[2:]
+			continue
+		}
 		n, err := strconv.Atoi(args[1])
 		if err != nil || n <= 0 {
 			return errors.New("--nproc needs a number above 0")
@@ -66,6 +76,16 @@ func ChildMain(args []string) error {
 		if err := lim(rlimitNproc, uint64(nproc)); err != nil { // counted for the whole user: the customer's own, the user ids are not shared
 			return err
 		}
+	}
+	// The gate: the spawner puts this process in its cgroup and then closes the write end. Until then nothing of the customer's runs. A closed end with no data is the signal (end of file);
+	// anything else (an error) ends the process.
+	if gateFD >= 0 {
+		g := os.NewFile(uintptr(gateFD), "gate")
+		var one [1]byte
+		if _, err := g.Read(one[:]); err != nil && !errors.Is(err, io.EOF) {
+			return fmt.Errorf("the gate: %w", err)
+		}
+		_ = g.Close() // workerd must not inherit it
 	}
 	argv := []string{"workerd", "serve", "--socket-fd", "http=3", config}
 	return syscall.Exec(workerd, argv, os.Environ())

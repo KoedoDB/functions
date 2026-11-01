@@ -64,11 +64,12 @@ type launcher struct {
 	// sampler makes the sampler of a process; the tests give their own.
 	sampler func(p *WProc) sampler
 
-	mu     sync.Mutex
-	starts int
-	seq    int
-	traps  atomic.Int64 // processes the kernel ended for a system call of the seccomp tripwire
-	live   map[string]int // processes of a customer that are running (real ones and probes): when it reaches 0 the user has nothing left
+	mu           sync.Mutex
+	starts       int
+	seq          int
+	traps        atomic.Int64   // processes the kernel ended for a system call of the seccomp tripwire
+	noIntoCgroup atomic.Bool    // clone3 (CLONE_INTO_CGROUP) is refused here (the guest's seccomp answers ENOSYS): the child is started outside and moved in while it waits (see gate)
+	live         map[string]int // processes of a customer that are running (real ones and probes): when it reaches 0 the user has nothing left
 }
 
 func newLauncher(cfg Config, log *slog.Logger, lookup func(string) *customer) *launcher {
@@ -191,36 +192,109 @@ func (l *launcher) begin(rs runSpec) (*begun, error) {
 	for _, k := range secretNames {
 		env = append(env, wdconfig.SecretEnvPrefix+k+"="+c.secrets[k])
 	}
-	cmd := exec.Command(l.child(), "child", "--nproc", strconv.Itoa(l.cfg.PidsLimit*4), l.cfg.Workerd, cfgPath)
-	cmd.Dir = runDir
-	cmd.Env = env
-	cmd.ExtraFiles = []*os.File{lf} // file descriptor 3
-	if rs.extraOut != nil {
-		cmd.Stdout, cmd.Stderr = rs.extraOut, rs.extraOut
-	} else {
-		w := newLineWriter(l.log, c.id)
-		cmd.Stdout, cmd.Stderr = w, w
+	// start makes and starts the command. With gate, the child waits on file descriptor 4 until the spawner has put it in its cgroup (and then closes it): clone3 with CLONE_INTO_CGROUP is not
+	// available there, and the process must not run outside of the limits for any time. The gate's write end is returned; the caller moves the process and closes it.
+	start := func(intoCgroup, gate bool, cgDir string) (*exec.Cmd, *os.File, error) {
+		args := []string{"child", "--nproc", strconv.Itoa(l.cfg.PidsLimit * 4)}
+		if gate {
+			args = append(args, "--gate-fd", "4")
+		}
+		cmd := exec.Command(l.child(), append(args, l.cfg.Workerd, cfgPath)...)
+		cmd.Dir = runDir
+		cmd.Env = env
+		cmd.ExtraFiles = []*os.File{lf} // file descriptor 3
+		var gateW *os.File
+		if gate {
+			gr, gw, err := os.Pipe()
+			if err != nil {
+				return nil, nil, err
+			}
+			defer gr.Close()
+			cmd.ExtraFiles = append(cmd.ExtraFiles, gr) // file descriptor 4
+			gateW = gw
+		}
+		if rs.extraOut != nil {
+			cmd.Stdout, cmd.Stderr = rs.extraOut, rs.extraOut
+		} else {
+			w := newLineWriter(l.log, c.id)
+			cmd.Stdout, cmd.Stderr = w, w
+		}
+		cmd.SysProcAttr = &syscall.SysProcAttr{
+			Setpgid:    true,
+			Credential: &syscall.Credential{Uid: uint32(c.uid), Gid: uint32(c.uid), Groups: []uint32{}}, // groups: none, set explicitly (setgroups)
+		}
+		if intoCgroup {
+			f, err := os.Open(cgDir)
+			if err != nil {
+				if gateW != nil {
+					gateW.Close()
+				}
+				return nil, nil, err
+			}
+			defer f.Close()
+			cmd.SysProcAttr.UseCgroupFD = true // clone straight into the cgroup: no moment outside of the limits
+			cmd.SysProcAttr.CgroupFD = int(f.Fd())
+		}
+		if err := cmd.Start(); err != nil {
+			if gateW != nil {
+				gateW.Close()
+			}
+			return nil, nil, err
+		}
+		return cmd, gateW, nil
 	}
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Setpgid:    true,
-		Credential: &syscall.Credential{Uid: uint32(c.uid), Gid: uint32(c.uid), Groups: []uint32{}}, // groups: none, set explicitly (setgroups)
-	}
+	var cmd *exec.Cmd
 	if l.cfg.CgroupRoot != "" {
 		cg, err := newCgroup(l.cfg.CgroupRoot, rs.name, c.limits.MemoryMiB, c.limits.CPUQuotaPct, c.limits.Pids)
 		if err != nil {
 			return fail(fmt.Errorf("the cgroup of %s: %w", c.id, err))
 		}
 		b.cg = cg
-		if f, err := os.Open(cg.dir); err == nil && isCgroup2(cg.dir) {
-			defer f.Close()
-			cmd.SysProcAttr.UseCgroupFD = true // clone straight into the cgroup: no moment outside of the limits
-			cmd.SysProcAttr.CgroupFD = int(f.Fd())
+		if !isCgroup2(cg.dir) {
+			// not a cgroup file system (a test directory): the limits are files in a directory and nothing more
+			l.addLive(c.id, 1)
+			var err error
+			if cmd, _, err = start(false, false, ""); err != nil {
+				l.addLive(c.id, -1)
+				return fail(err)
+			}
+		} else {
+			l.addLive(c.id, 1)
+			var gateW *os.File
+			var err error
+			if !l.noIntoCgroup.Load() {
+				cmd, gateW, err = start(true, false, cg.dir)
+				if errors.Is(err, syscall.ENOSYS) {
+					l.noIntoCgroup.Store(true)
+					l.log.Warn("clone3 into a cgroup is not available here: the child waits at a gate until it is in its cgroup", "customer", c.id)
+					err = nil
+					cmd = nil
+				}
+			}
+			if cmd == nil && err == nil {
+				if cmd, gateW, err = start(false, true, ""); err == nil {
+					if werr := os.WriteFile(filepath.Join(cg.dir, "cgroup.procs"), []byte(strconv.Itoa(cmd.Process.Pid)), 0o644); werr != nil {
+						_ = cmd.Process.Kill()
+						_ = gateW.Close()
+						_ = cmd.Wait()
+						l.addLive(c.id, -1)
+						return fail(fmt.Errorf("the cgroup of %s: put the process in: %w", c.id, werr))
+					}
+					_ = gateW.Close() // the child goes on to workerd
+				}
+			}
+			if err != nil {
+				l.addLive(c.id, -1)
+				return fail(err)
+			}
 		}
-	}
-	l.addLive(c.id, 1)
-	if err := cmd.Start(); err != nil {
-		l.addLive(c.id, -1)
-		return fail(err)
+	} else {
+		l.addLive(c.id, 1)
+		var err error
+		if cmd, _, err = start(false, false, ""); err != nil {
+			l.addLive(c.id, -1)
+			return fail(err)
+		}
 	}
 	b.cmd = cmd
 	return b, nil

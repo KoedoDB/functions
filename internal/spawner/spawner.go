@@ -60,6 +60,11 @@ func New(cfg Config, logger *slog.Logger) (*Server, error) {
 	if err := checkCaps(logger); err != nil {
 		return nil, err
 	}
+	if cfg.CgroupRoot != "" && isCgroup2(cfg.CgroupRoot) {
+		if err := prepareCgroupRoot(cfg.CgroupRoot); err != nil {
+			return nil, fmt.Errorf("the cgroup of the spawner (WD_CGROUP_ROOT=%s): %w", cfg.CgroupRoot, err)
+		}
+	}
 	if st, err := os.Stat(cfg.Workerd); err != nil || st.Mode()&0o111 == 0 || st.Mode()&0o001 == 0 {
 		return nil, fmt.Errorf("WORKERD_BIN=%q is not an executable file that every user may run", cfg.Workerd)
 	}
