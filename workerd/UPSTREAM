@@ -1,4 +1,4 @@
 # The upstream release of cloudflare/workerd the patches in patches/ apply to (read by build.sh and by scripts/check-advisories of the KoedoDB repository).
 # To move to a newer release: rebase the patches onto it (git rebase --onto <new tag> <old tag> koedodb-limits in the fork, then git format-patch), change these two lines, run build.sh, run the tests.
-UPSTREAM_TAG=v1.20261023.1
-UPSTREAM_REV=7caf6dee5bfe9af1b7710ddf66222900007af080
+UPSTREAM_TAG=v1.20261101.1
+UPSTREAM_REV=6472e6eeb0c664273a021a0f676d0618d3f81af6

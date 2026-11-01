@@ -1,4 +1,4 @@
-From 0d1b354661cbe11bc3fb789572aa4bf5ded36ee2 Mon Sep 17 00:00:00 2001
+From 2fa628c57473c646733280cbf7639c8e2ecaf7cf Mon Sep 17 00:00:00 2001
 From: banil246 <igoigo246@gmail.com>
 Date: Sun, 18 Oct 2026 05:31:32 +0900
 Subject: [PATCH 2/3] koedodb limits: a cap on subrequests open at once per
@@ -102,6 +102,3 @@ index 89693e0d5..687683b7c 100644
    }
  };
  
--- 
-2.53.0
-

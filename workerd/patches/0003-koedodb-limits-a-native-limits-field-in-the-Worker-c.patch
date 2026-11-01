@@ -1,4 +1,4 @@
-From 9dbd503f5b68df0ae664fe4bb9cade3a8b94daf2 Mon Sep 17 00:00:00 2001
+From 3c026d9f30c7b574157c1eeb7aef19bcfb3f9f9c Mon Sep 17 00:00:00 2001
 From: banil246 <igoigo246@gmail.com>
 Date: Sun, 18 Oct 2026 05:39:58 +0900
 Subject: [PATCH 3/3] koedodb limits: a native 'limits' field in the Worker
@@ -50,10 +50,10 @@ index 687683b7c..2f0560d61 100644
  // The enforcer of one request (one IoContext) of the Worker called `name`; none when the Worker has
  // no limits.
 diff --git a/src/workerd/server/factory/worker-factory.c++ b/src/workerd/server/factory/worker-factory.c++
-index 91d6632d1..c6814c5f6 100644
+index f5dfff14b..f755b513e 100644
 --- a/src/workerd/server/factory/worker-factory.c++
 +++ b/src/workerd/server/factory/worker-factory.c++
-@@ -1608,7 +1608,13 @@ kj::Promise<kj::Own<CompiledWorker>> factory_new_worker(const WorkerFactory& con
+@@ -1610,7 +1610,13 @@ kj::Promise<kj::Own<CompiledWorker>> factory_new_worker(const WorkerFactory& con
                           kj::Maybe<jsg::SnapshotConfig> snapshotConfig) {
      auto group = jsg::newIsolateGroup();
      kj::Own<IsolateLimitEnforcer> limitEnforcer = kj::refcounted<NullIsolateLimitEnforcer>();
@@ -69,10 +69,10 @@ index 91d6632d1..c6814c5f6 100644
      }
      auto listeners = KJ_MAP(listener, spec.inbound_listeners) {
 diff --git a/src/workerd/server/server/bridge.rs b/src/workerd/server/server/bridge.rs
-index bf4eeddfc..d1b8ee659 100644
+index 20de6a144..1c12ea770 100644
 --- a/src/workerd/server/server/bridge.rs
 +++ b/src/workerd/server/server/bridge.rs
-@@ -112,6 +112,19 @@ pub mod ffi {
+@@ -115,6 +115,19 @@ pub mod ffi {
          /// `accessBlobHeader`, when set: requests carrying this header have it parsed into the
          /// request's access info.
          access_blob_header: KjMaybe<String>,
@@ -93,10 +93,10 @@ index bf4eeddfc..d1b8ee659 100644
  
      /// A header the rewriter sets to `value`, or removes when it has none. `name` is a header
 diff --git a/src/workerd/server/server/worker.rs b/src/workerd/server/server/worker.rs
-index 2d526ac5d..961243716 100644
+index 73bbf9745..00c765dd7 100644
 --- a/src/workerd/server/server/worker.rs
 +++ b/src/workerd/server/server/worker.rs
-@@ -179,6 +179,19 @@ impl WorkerService {
+@@ -180,6 +180,19 @@ impl WorkerService {
              inbound_listeners,
              globals: std::mem::take(&mut bindings.globals),
              access_blob_header: access_blob_header.into(),
@@ -116,7 +116,7 @@ index 2d526ac5d..961243716 100644
          };
          let compiled = ffi::factory_new_worker(
              factory.raw(),
-@@ -275,6 +288,7 @@ impl WorkerService {
+@@ -276,6 +289,7 @@ impl WorkerService {
              inbound_listeners: Vec::new(),
              globals: Vec::new(),
              access_blob_header: KjMaybe::None,
@@ -125,10 +125,10 @@ index 2d526ac5d..961243716 100644
          let compiled =
              ffi::factory_new_worker(factory.raw(), &spec, KjMaybe::None, KjMaybe::Some(source))
 diff --git a/src/workerd/server/workerd.capnp b/src/workerd/server/workerd.capnp
-index 52c133106..632c2a7d4 100644
+index 63457f661..de53e6a44 100644
 --- a/src/workerd/server/workerd.capnp
 +++ b/src/workerd/server/workerd.capnp
-@@ -859,6 +859,33 @@ struct Worker {
+@@ -948,6 +948,33 @@ struct Worker {
  
    workflowsEngine @20 :WorkflowsEngine;
    # the externally-supplied service responsible for running Workflows defined in this worker
@@ -162,6 +162,3 @@ index 52c133106..632c2a7d4 100644
  }
  
  struct ExternalServer {
--- 
-2.53.0
-
