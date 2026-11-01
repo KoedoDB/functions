@@ -120,7 +120,7 @@ func ConfigFromEnv(lookup func(string) (string, bool), cgroupMemoryMiB func() (f
 		UIDCount:       int(num("UID_COUNT", 1000)),
 		IdleTimeout:    ms("IDLE_MS", 30000),
 		StartTimeout:   ms("START_MS", 30000),
-		LeaseTTL:       ms("LEASE_TTL_MS", 20000),
+		LeaseTTL:       ms("LEASE_TTL_MS", 80000),
 		EstimateMiB:    num("FN_ESTIMATE_MIB", 50), // an idle workerd is about 50 MiB resident (doc/WORKERD-LIMITS.md of the KoedoDB repository)
 		MinResidency:   ms("FN_MIN_RESIDENCY_MS", 1000),
 		Wait:           ms("FN_WAIT_MS", 5000),
@@ -139,12 +139,12 @@ func ConfigFromEnv(lookup func(string) (string, bool), cgroupMemoryMiB func() (f
 		RunawayLooks:   int(num("WD_RUNAWAY_LOOKS", 5)),
 		CgroupRoot:     str("WD_CGROUP_ROOT", ""),
 		FnDefault: wdconfig.FnLimits{
-			HeapMB: u32(num("FN_HEAP_MB", 256)), CPUMs: u32(num("FN_CPU_MS", 1000)), WallMs: u32(num("FN_WALL_MS", 8000)), ExternalMB: u32(num("FN_EXTERNAL_MB", 128)),
+			HeapMB: u32(num("FN_HEAP_MB", 256)), CPUMs: u32(num("FN_CPU_MS", 1000)), WallMs: u32(num("FN_WALL_MS", 60000)), ExternalMB: u32(num("FN_EXTERNAL_MB", 128)),
 			Subrequests: u32(num("FN_SUBREQUESTS", 50)), ConcurrentSubrequests: u32(num("FN_CONCURRENT_SUBREQUESTS", 32)),
 		},
-		// WallMs: the router gives up on a request after REQUEST_MS (10 s) and kills the process, so a function's wall limit must be reached first.
+		// WallMs: the router gives up on a request after REQUEST_MS (70 s) and kills the process, so a function's wall limit must be reached first.
 		FnMax: wdconfig.FnLimits{
-			HeapMB: u32(num("FN_MAX_HEAP_MB", 512)), CPUMs: u32(num("FN_MAX_CPU_MS", 5000)), WallMs: u32(num("FN_MAX_WALL_MS", 9000)), ExternalMB: u32(num("FN_MAX_EXTERNAL_MB", 512)),
+			HeapMB: u32(num("FN_MAX_HEAP_MB", 512)), CPUMs: u32(num("FN_MAX_CPU_MS", 5000)), WallMs: u32(num("FN_MAX_WALL_MS", 60000)), ExternalMB: u32(num("FN_MAX_EXTERNAL_MB", 512)),
 			Subrequests: u32(num("FN_MAX_SUBREQUESTS", 1000)), ConcurrentSubrequests: u32(num("FN_MAX_CONCURRENT_SUBREQUESTS", 256)),
 		},
 	}

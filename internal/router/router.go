@@ -21,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"syscall"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -64,11 +65,11 @@ func ConfigFromEnv(lookup func(string) (string, bool)) (Config, error) {
 	c := Config{
 		Listen:             str("LISTEN", ":9000"),
 		Control:            str("CONTROL_DIR", "/sockets"),
-		RequestTimeout:     time.Duration(num("REQUEST_MS", 10000)) * time.Millisecond,
+		RequestTimeout:     time.Duration(num("REQUEST_MS", 70000)) * time.Millisecond,
 		AcquireTimeout:     time.Duration(num("ACQUIRE_MS", 40000)) * time.Millisecond,
-		MaxConcurrent:      int(num("MAX_CONCURRENT", 20)),
-		CustomerConcurrent: int(num("CUSTOMER_CONCURRENT", 40)),
-		MaxInflight:        int(num("MAX_INFLIGHT", 400)),
+		MaxConcurrent:      int(num("MAX_CONCURRENT", 100)),
+		CustomerConcurrent: int(num("CUSTOMER_CONCURRENT", 200)),
+		MaxInflight:        int(num("MAX_INFLIGHT", 1500)),
 	}
 	if len(errs) > 0 {
 		return c, fmt.Errorf("settings: %s", strings.Join(errs, "; "))
@@ -319,6 +320,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				outcome = "timeout" // an overrun: the customer's process goes, and with it every request in it; the next request starts a fresh one
 				http.Error(w, "function timed out", http.StatusGatewayTimeout)
 			case r.Context().Err() != nil:
+			case errors.Is(err, syscall.EMFILE) || errors.Is(err, syscall.ENFILE):
+				// The router itself has run out of file descriptors (two for each request in flight): the customer's process did nothing wrong, and killing it would fail every other request in it.
+				s.log.Error("the router has no file descriptor left", "customer", customer, "function", name, "error", err)
+				w.Header().Set("retry-after", "1")
+				http.Error(w, "busy", http.StatusServiceUnavailable)
 			default:
 				s.log.Warn("a request to a customer's process failed", "customer", customer, "function", name, "error", err)
 				outcome = "broken"

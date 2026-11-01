@@ -6,7 +6,7 @@ A customer's functions run in **one workerd process** (one Worker per function).
 |---|---|---|---|
 | `heap_mb` (V8 old generation) | 256 | 512 | the request that filled the heap ends with 500; the process lives on |
 | `cpu_ms` (CPU time of one request, thread CPU clock, summed over the runs of JavaScript) | 1000 | 5000 | 500 after about that time; the isolate is resumed for the next request |
-| `wall_ms` (wall-clock time of one request) | 8000 | 9000 | 500 (the router gives up on a request after `REQUEST_MS`, 10 s, and kills the process: the function's limit must come first) |
+| `wall_ms` (wall-clock time of one request) | 60000 | 60000 | 500 (the router gives up on a request after `REQUEST_MS`, 70 s, and kills the process: the function's limit must come first) |
 | `external_mb` (ArrayBuffer and typed arrays) | 128 | 512 | the allocation fails with a `RangeError` the function can catch |
 | `subrequests` (per request: fetch, WebSocket, cache, `connect()`) | 50 | 1000 | `Too many subrequests.` |
 | `concurrent_subrequests` (open at once, over all requests of the function) | 32 | 256 | `Too many concurrent subrequests.` |

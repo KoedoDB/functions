@@ -3,7 +3,7 @@ package spawner
 // The control API: how the Regional Agent puts a customer's functions and secrets into the VM. HTTPS with mutual TLS only (TLS 1.3, a client certificate signed by CONTROL_CLIENT_CA whose
 // common name is in CONTROL_ALLOW_CN); there is no plain mode and no token. It is the only way a bundle or a secret gets in.
 //
-//	PUT    /v1/customers/<id>   {"functions": {"<name>": {"bundle": "<base64 of index.mjs>", "limits": {"heap_mb": 256, "cpu_ms": 1000, "wall_ms": 8000, "external_mb": 128, "subrequests": 50, "concurrent_subrequests": 32}}}, "secrets": {"NAME": "value"}, "limits": {"memory_mib": 128, "cpu_quota_pct": 50, "pids": 32}}
+//	PUT    /v1/customers/<id>   {"functions": {"<name>": {"bundle": "<base64 of index.mjs>", "limits": {"heap_mb": 256, "cpu_ms": 1000, "wall_ms": 60000, "external_mb": 128, "subrequests": 50, "concurrent_subrequests": 32}}}, "secrets": {"NAME": "value"}, "limits": {"memory_mib": 128, "cpu_quota_pct": 50, "pids": 32}}
 //	DELETE /v1/customers/<id>
 //	GET    /v1/customers        what the VM holds (never the secrets' values), for the Agent to reconcile after a restart: the state is in memory only
 //	GET    /v1/stats            the pool's statistics

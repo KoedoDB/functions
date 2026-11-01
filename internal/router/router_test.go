@@ -41,7 +41,7 @@ func TestTheSettingsAreReadAndATypoIsAnError(t *testing.T) {
 		return func(k string) (string, bool) { v, ok := m[k]; return v, ok }
 	}
 	c, err := ConfigFromEnv(env(nil))
-	if err != nil || c.Listen != ":9000" || c.Control != "/sockets" || c.MaxConcurrent != 20 || c.CustomerConcurrent != 40 || c.MaxInflight != 400 || c.RequestTimeout != 10*time.Second {
+	if err != nil || c.Listen != ":9000" || c.Control != "/sockets" || c.MaxConcurrent != 100 || c.CustomerConcurrent != 200 || c.MaxInflight != 1500 || c.RequestTimeout != 70*time.Second {
 		t.Errorf("defaults: %+v %v", c, err)
 	}
 	for _, bad := range []map[string]string{{"REQUEST_MS": "x"}, {"MAX_CONCURRENT": "0"}, {"MAX_INFLIGHT": "-1"}} {

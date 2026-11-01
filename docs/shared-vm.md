@@ -90,7 +90,7 @@ GET  /v1/ping
 - **The VM's memory** is the budget: `FN_BUDGET_MIB` is the Pod's memory limit less `SUPERVISOR_RESERVE_MIB` (60). A customer's process is about 50 MiB idle and counts as at least `FN_ESTIMATE_MIB`; at 100 customers in a 1.5 GiB budget the pool keeps about 27 resident and stops the least recently used for the next (measured in the tests).
 - **NetworkPolicy** (outside the VM, on the Pod): ingress to 9000 from the edge only and to 9443 from the Regional Agent only; **egress to the public internet only** (not the node, not other Pods, not the metadata address, not the cluster's ranges). workerd's own default refuses private addresses, but that is a second line, not the first.
 - **Probes**: `GET :9000/_healthz` (the router asks the spawner) is both liveness and readiness. A ready Pod may still be empty: the Regional Agent puts the customers.
-- `LEASE_TTL_MS` (20 s) must be longer than the router's `REQUEST_MS` (10 s).
+- `LEASE_TTL_MS` (80 s) must be longer than the router's `REQUEST_MS` (70 s), which must be longer than a function's `wall_ms` (at most 60 s).
 - `WD_CGROUP_ROOT` is set when the guest's agent hands the spawner a delegated cgroup v2 directory: the code is in and tested against a directory; it has **not** been tried on a real delegated cgroup in a guest yet.
 
 ## Security properties, and what is not guaranteed
@@ -140,13 +140,13 @@ All by environment variables; a value that is not a number is an error at start,
 | `CONTROL_ALLOW_CN` | **required** | the common names that may call (comma-separated) |
 | `IDLE_MS` | 30000 | stop a process with no request for this long |
 | `START_MS` | 30000 | how long to wait for a process to answer |
-| `LEASE_TTL_MS` | 20000 | release a lease the router has not released |
+| `LEASE_TTL_MS` | 80000 | release a lease the router has not released |
 | `FN_BUDGET_MIB` | the cgroup limit less the reserve, else 1024 | memory the processes may use together |
 | `SUPERVISOR_RESERVE_MIB` | 60 | what the two supervisors take |
 | `FN_ESTIMATE_MIB`, `FN_MIN_RESIDENCY_MS`, `FN_WAIT_MS`, `FN_MAX_WAITERS` | 50, 1000, 5000, 20 | the pool (`internal/residents`) |
 | `MAX_CUSTOMERS`, `MAX_FUNCTIONS`, `MAX_SECRETS`, `MAX_BUNDLE_BYTES`, `MAX_STATE_BYTES`, `MAX_PROBES` | 1000, 50, 64, 5 MiB, 256 MiB, 4 | what a put may hold |
 | `WD_MEMORY_MIB`, `WD_CPU_QUOTA_PCT`, `WD_PIDS` | 1024, 100, 64 | the platform's maximum limits of one customer's whole process, the outer wall (a put may ask for less) |
-| `FN_HEAP_MB`, `FN_CPU_MS`, `FN_WALL_MS`, `FN_EXTERNAL_MB`, `FN_SUBREQUESTS`, `FN_CONCURRENT_SUBREQUESTS` | 256, 1000, 8000, 128, 50, 32 | the limits of ONE function when the put says nothing; `FN_MAX_*` (512, 5000, 9000, 512, 1000, 256) are what a put may ask for at most ([limits.md](limits.md)) |
+| `FN_HEAP_MB`, `FN_CPU_MS`, `FN_WALL_MS`, `FN_EXTERNAL_MB`, `FN_SUBREQUESTS`, `FN_CONCURRENT_SUBREQUESTS` | 256, 1000, 60000, 128, 50, 32 | the limits of ONE function when the put says nothing; `FN_MAX_*` (512, 5000, 9000, 512, 1000, 256) are what a put may ask for at most ([limits.md](limits.md)) |
 | `WD_LOOK_MS`, `WD_RUNAWAY_LOOKS`, `WD_MEMORY_LOOK_MS` | 2000, 5, 250 | the looks |
 | `WD_CGROUP_ROOT` | | a writable cgroup v2 directory handed down to the spawner |
 
@@ -156,10 +156,10 @@ All by environment variables; a value that is not a number is an error at start,
 |---|---|---|
 | `LISTEN` | `:9000` | address |
 | `CONTROL_DIR` | `/sockets` | the shared directory |
-| `REQUEST_MS` | 10000 | cancel a request (504) and have its process killed |
+| `REQUEST_MS` | 70000 | cancel a request (504) and have its process killed |
 | `ACQUIRE_MS` | 40000 | how long to wait for the spawner (room, a start) |
-| `MAX_CONCURRENT` | 20 | requests one function serves at once (429 beyond) |
-| `CUSTOMER_CONCURRENT` | 40 | requests one customer is served at once, all its functions (429) |
-| `MAX_INFLIGHT` | 400 | requests in all (503 with `Retry-After`) |
+| `MAX_CONCURRENT` | 100 | requests one function serves at once (429 beyond) |
+| `CUSTOMER_CONCURRENT` | 200 | requests one customer is served at once, all its functions (429) |
+| `MAX_INFLIGHT` | 1500 | requests in all (503 with `Retry-After`); each takes two file descriptors of the router (4096 in the VM), and 2000 at once ran (2026-11-01, 10 s sleep) with 4000 of the 4096 used: 1500 keeps room |
 
 The answers the router gives itself: 400 a bad name, 404 no such customer or function, 429 too many for a function or a customer, 502 the process did not start or died or the spawner does not answer, 503 busy (no room within `FN_WAIT_MS`, or `MAX_INFLIGHT`), 504 a request took longer than `REQUEST_MS` (its process is killed; the next request starts a new one). Headers that start with `X-Koedodb-` are removed from a request, so that the edge's own cannot be forged, and `X-Forwarded-For` is not passed on.

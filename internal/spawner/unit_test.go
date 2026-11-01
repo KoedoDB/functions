@@ -41,7 +41,7 @@ func TestTheSettingsAreReadAndATypoIsAnError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Control != "/sockets" || c.State != "/state" || c.RouterUID != 10001 || c.UIDBase != 20000 || c.UIDCount != 1000 || c.BudgetMiB != 1024 || c.MemoryMiB != 1024 || c.FnDefault.HeapMB != 256 || c.FnDefault.CPUMs != 1000 || c.FnDefault.WallMs != 8000 || c.CPUQuotaPct != 100 ||
+	if c.Control != "/sockets" || c.State != "/state" || c.RouterUID != 10001 || c.UIDBase != 20000 || c.UIDCount != 1000 || c.BudgetMiB != 1024 || c.MemoryMiB != 1024 || c.FnDefault.HeapMB != 256 || c.FnDefault.CPUMs != 1000 || c.FnDefault.WallMs != 60000 || c.CPUQuotaPct != 100 ||
 		c.Look != 2*time.Second || c.MemoryLook != 250*time.Millisecond || c.RunawayLooks != 5 || c.PidsLimit != 64 || c.Workerd != "/sup/workerd" || c.MaxCustomers != 1000 ||
 		!slices.Equal(c.ControlAllow, []string{"regional-agent"}) || c.ControlListen != ":9443" {
 		t.Errorf("defaults: %+v", c)
@@ -161,7 +161,7 @@ func TestADefinitionIsValidatedBeforeAnythingIsStartedAndTheLimitsAreCappedByThe
 	if e := s.Validate("acme", &d); e != nil {
 		t.Fatal(e)
 	}
-	if got, want := d.FnLimits["hello"], (wdconfig.FnLimits{HeapMB: 64, CPUMs: 100, WallMs: 8000, ExternalMB: 128, Subrequests: 50, ConcurrentSubrequests: 32}); got != want {
+	if got, want := d.FnLimits["hello"], (wdconfig.FnLimits{HeapMB: 64, CPUMs: 100, WallMs: 60000, ExternalMB: 128, Subrequests: 50, ConcurrentSubrequests: 32}); got != want {
 		t.Errorf("function limits: %+v, want %+v", got, want)
 	}
 	d = good()
@@ -194,7 +194,7 @@ func TestADefinitionIsValidatedBeforeAnythingIsStartedAndTheLimitsAreCappedByThe
 		"a heap above the maximum":                 func(id *string, d *Definition) { d.FnLimits = map[string]wdconfig.FnLimits{"hello": {HeapMB: 513}} },
 		"a heap too small":                         func(id *string, d *Definition) { d.FnLimits = map[string]wdconfig.FnLimits{"hello": {HeapMB: 8}} },
 		"more CPU time than allowed":               func(id *string, d *Definition) { d.FnLimits = map[string]wdconfig.FnLimits{"hello": {CPUMs: 5001}} },
-		"a longer wall time than the router waits": func(id *string, d *Definition) { d.FnLimits = map[string]wdconfig.FnLimits{"hello": {WallMs: 9001}} },
+		"a longer wall time than the router waits": func(id *string, d *Definition) { d.FnLimits = map[string]wdconfig.FnLimits{"hello": {WallMs: 60001}} },
 		"more subrequests": func(id *string, d *Definition) {
 			d.FnLimits = map[string]wdconfig.FnLimits{"hello": {Subrequests: 1001}}
 		},
