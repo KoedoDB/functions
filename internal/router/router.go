@@ -193,6 +193,9 @@ func (s *Server) acquire(ctx context.Context, customer, name string) (*acquired,
 			return nil, 0, ""
 		}
 		s.log.Error("the spawner does not answer", "error", err)
+		if errors.Is(err, syscall.EMFILE) || errors.Is(err, syscall.ENFILE) {
+			return nil, http.StatusServiceUnavailable, "busy" // the router's own descriptors are all in use: try again, the function is not at fault
+		}
 		return nil, http.StatusBadGateway, "function failed to start"
 	}
 	defer res.Body.Close()
